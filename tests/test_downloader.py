@@ -5,6 +5,7 @@ from ttd_bot.downloader import (
     extract_tiktok_url,
     is_tiktok_photo_url,
     normalize_tiktok_download_url,
+    resolve_tiktok_url,
 )
 
 
@@ -80,3 +81,24 @@ def test_extract_photo_image_urls_reads_image_post_data() -> None:
         "https://example.com/1.jpg",
         "https://example.com/2.webp",
     ]
+
+
+def test_resolve_tiktok_url_returns_redirect_target_for_short_link(monkeypatch: pytest.MonkeyPatch) -> None:
+    class DummyResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def geturl(self) -> str:
+            return "https://www.tiktok.com/@gallerieapp/photo/7634004117156908318?_r=1&_t=ZS-96CU8sYh4f2"
+
+    monkeypatch.setattr(
+        "ttd_bot.downloader._open_url",
+        lambda url, cookies_path=None, referer=None: DummyResponse(),
+    )
+
+    assert resolve_tiktok_url("https://vt.tiktok.com/ZS9n2pqYV/") == (
+        "https://www.tiktok.com/@gallerieapp/photo/7634004117156908318?_r=1&_t=ZS-96CU8sYh4f2"
+    )

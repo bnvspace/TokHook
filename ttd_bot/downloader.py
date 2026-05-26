@@ -68,9 +68,10 @@ def extract_tiktok_url(text: str) -> str | None:
 
 
 def download_tiktok_media(url: str, download_dir: Path, cookies_path: Path | None = None) -> DownloadedMedia:
-    normalized_url = normalize_tiktok_download_url(url)
+    resolved_url = resolve_tiktok_url(url, cookies_path)
+    normalized_url = normalize_tiktok_download_url(resolved_url)
 
-    if is_tiktok_photo_url(url):
+    if is_tiktok_photo_url(resolved_url):
         images = _download_photo_post_images(normalized_url, download_dir, cookies_path)
         if images:
             return DownloadedMedia(videos=[], images=images)
@@ -134,6 +135,18 @@ def normalize_tiktok_download_url(url: str) -> str:
 
     normalized_path = f"/@{match.group('user')}/video/{match.group('id')}"
     return urlunparse(parsed._replace(path=normalized_path, query="", fragment=""))
+
+
+def resolve_tiktok_url(url: str, cookies_path: Path | None = None) -> str:
+    parsed = urlparse(url)
+    if TIKTOK_POST_PATH_RE.match(parsed.path):
+        return url
+
+    try:
+        with _open_url(url, cookies_path=cookies_path) as response:
+            return response.geturl()
+    except (HTTPError, URLError, OSError):
+        return url
 
 
 def _collect_downloaded_media(download_dir: Path) -> list[Path]:
