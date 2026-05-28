@@ -16,6 +16,7 @@ from ttd_bot.downloader import DownloadedMedia, TikTokDownloadError, download_ti
 
 router = Router()
 SETTINGS: Settings | None = None
+TEMP_ROOT = Path(__file__).resolve().parents[1] / "tmp"
 
 START_TEXT = (
     "Привет. Пришли ссылку на TikTok, и я верну тебе видео "
@@ -48,7 +49,8 @@ async def link_handler(message: Message) -> None:
     progress_message = await message.answer("Скачиваю медиа...")
 
     try:
-        with TemporaryDirectory(prefix="ttd_") as temp_dir:
+        TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix="ttd_", dir=TEMP_ROOT) as temp_dir:
             download_dir = Path(temp_dir)
             async with ChatActionSender.upload_document(chat_id=message.chat.id, bot=message.bot):
                 media = await asyncio.to_thread(
