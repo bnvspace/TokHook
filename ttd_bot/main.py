@@ -58,6 +58,7 @@ async def link_handler(message: Message) -> None:
                     url,
                     download_dir,
                     _get_settings().tiktok_cookies_path,
+                    _get_settings().camoufox_profile_path,
                 )
 
             await progress_message.edit_text("Отправляю медиа...")

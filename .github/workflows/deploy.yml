@@ -93,6 +93,7 @@ jobs:
           "$APP_DIR/.venv/bin/python3" -m pip install \
             --disable-pip-version-check \
             -r "$release_dir/requirements.txt"
+          "$APP_DIR/.venv/bin/python3" -m camoufox fetch
 
           mkdir -p "$APP_DIR/ttd_bot"
           cp -a "$release_dir/ttd_bot/." "$APP_DIR/ttd_bot/"

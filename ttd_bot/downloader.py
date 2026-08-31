@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import mimetypes
 import re
 from dataclasses import dataclass
@@ -13,6 +14,9 @@ from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 TIKTOK_URL_RE = re.compile(
@@ -67,7 +71,12 @@ def extract_tiktok_url(text: str) -> str | None:
     return url
 
 
-def download_tiktok_media(url: str, download_dir: Path, cookies_path: Path | None = None) -> DownloadedMedia:
+def download_tiktok_media(
+    url: str,
+    download_dir: Path,
+    cookies_path: Path | None = None,
+    camoufox_profile_path: Path | None = None,
+) -> DownloadedMedia:
     resolved_url = resolve_tiktok_url(url, cookies_path)
     normalized_url = normalize_tiktok_download_url(resolved_url)
 
@@ -93,11 +102,13 @@ def download_tiktok_media(url: str, download_dir: Path, cookies_path: Path | Non
     if cookies_path:
         ydl_options["cookiefile"] = str(cookies_path)
 
+    info: object | None = None
+    download_error: DownloadError | None = None
     try:
         with YoutubeDL(ydl_options) as ydl:
             info = ydl.extract_info(normalized_url, download=True)
     except DownloadError as exc:
-        raise TikTokDownloadError(_friendly_download_error(exc)) from exc
+        download_error = exc
 
     media_files = _collect_downloaded_media(download_dir)
     if not media_files:
@@ -110,12 +121,36 @@ def download_tiktok_media(url: str, download_dir: Path, cookies_path: Path | Non
     images = [path for path in media_files if path.suffix.lower() in IMAGE_EXTENSIONS]
     result = DownloadedMedia(videos=videos, images=images)
 
-    if result.is_empty:
-        raise TikTokDownloadError(
-            "Не удалось найти видео или изображения по этой ссылке."
+    if not result.is_empty:
+        return result
+
+    if camoufox_profile_path is None:
+        camoufox_profile_path = download_dir.parent / "camoufox-profile"
+
+    try:
+        from ttd_bot.camoufox_fallback import (
+            CamoufoxUnavailable,
+            download_tiktok_media_with_camoufox,
         )
 
-    return result
+        browser_result = download_tiktok_media_with_camoufox(
+            normalized_url,
+            download_dir,
+            camoufox_profile_path,
+        )
+    except CamoufoxUnavailable:
+        browser_result = DownloadedMedia(videos=[], images=[])
+    except Exception:
+        LOGGER.exception("Camoufox fallback failed for %s", normalized_url)
+        browser_result = DownloadedMedia(videos=[], images=[])
+
+    if not browser_result.is_empty:
+        return browser_result
+
+    if download_error is not None:
+        raise TikTokDownloadError(_friendly_download_error(download_error)) from download_error
+
+    raise TikTokDownloadError("Не удалось найти видео или изображения по этой ссылке.")
 
 
 def is_tiktok_photo_url(url: str) -> bool:

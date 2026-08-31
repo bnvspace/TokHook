@@ -7,6 +7,7 @@ from ttd_bot.downloader import (
     normalize_tiktok_download_url,
     resolve_tiktok_url,
 )
+from ttd_bot.camoufox_fallback import _extract_media_urls
 
 
 @pytest.mark.parametrize(
@@ -81,6 +82,36 @@ def test_extract_photo_image_urls_reads_image_post_data() -> None:
         "https://example.com/1.jpg",
         "https://example.com/2.webp",
     ]
+
+
+def test_extract_media_urls_reads_video_and_image_post_data() -> None:
+    webpage = """
+    <script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">
+    {
+      "__DEFAULT_SCOPE__": {
+        "webapp.video-detail": {
+          "itemInfo": {
+            "itemStruct": {
+              "video": {
+                "playAddr": {"urlList": ["https://cdn.example/video.mp4"]}
+              },
+              "imagePost": {
+                "images": [
+                  {"imageURL": {"urlList": ["https://cdn.example/image.jpg"]}}
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+    </script>
+    """
+
+    candidates = _extract_media_urls(webpage)
+
+    assert candidates.videos == ["https://cdn.example/video.mp4"]
+    assert candidates.images == ["https://cdn.example/image.jpg"]
 
 
 def test_resolve_tiktok_url_returns_redirect_target_for_short_link(monkeypatch: pytest.MonkeyPatch) -> None:
