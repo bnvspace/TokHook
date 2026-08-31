@@ -15,6 +15,7 @@ class Settings:
     telegram_bot_token: str
     tiktok_cookies_path: Path | None
     camoufox_profile_path: Path
+    required_channel_username: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -36,8 +37,21 @@ class Settings:
             else Path(__file__).resolve().parents[1] / "tmp" / "camoufox-profile"
         )
 
+        required_channel_username = os.getenv(
+            "REQUIRED_CHANNEL_USERNAME",
+            "@GlitchTMA",
+        ).strip()
+        if not required_channel_username:
+            raise RuntimeError("Переменная REQUIRED_CHANNEL_USERNAME не задана.")
+        if (
+            not required_channel_username.startswith("@")
+            and not required_channel_username.startswith("-")
+        ):
+            required_channel_username = f"@{required_channel_username}"
+
         return cls(
             telegram_bot_token=telegram_bot_token,
             tiktok_cookies_path=tiktok_cookies_path,
             camoufox_profile_path=camoufox_profile_path,
+            required_channel_username=required_channel_username,
         )

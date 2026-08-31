@@ -6,8 +6,17 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart
-from aiogram.types import FSInputFile, InputMediaPhoto, Message
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    Message,
+)
 from aiogram.utils.chat_action import ChatActionSender
 
 from ttd_bot.config import Settings
@@ -18,20 +27,53 @@ router = Router()
 SETTINGS: Settings | None = None
 TEMP_ROOT = Path(__file__).resolve().parents[1] / "tmp"
 
-START_TEXT = (
-    "Привет. Пришли ссылку на TikTok, и я верну тебе видео "
-    "или изображения из этого поста."
-)
-
 HELP_TEXT = (
     "Просто отправь ссылку на TikTok-пост. "
     "Если TikTok ограничивает доступ, можно подключить cookies через .env."
 )
 
+SUBSCRIPTION_CALLBACK = "check_subscription"
+SUBSCRIBED_STATUSES = {"member", "administrator", "creator"}
 
+
+class SubscriptionCheckError(RuntimeError):
+    """Raised when Telegram did not allow checking channel membership."""
+
+
+@router.message(Command("strat"))
 @router.message(CommandStart())
 async def start_handler(message: Message) -> None:
-    await message.answer(START_TEXT)
+    await message.answer(
+        _start_text(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=_subscription_keyboard(),
+    )
+
+
+@router.callback_query(F.data == SUBSCRIPTION_CALLBACK)
+async def subscription_callback_handler(callback: CallbackQuery) -> None:
+    try:
+        is_subscribed = await _is_subscribed(callback.bot, callback.from_user.id)
+    except SubscriptionCheckError:
+        logging.exception("Could not check subscription for user %s", callback.from_user.id)
+        await callback.answer(
+            "Не удалось проверить подписку. Убедись, что бот добавлен администратором канала.",
+            show_alert=True,
+        )
+        return
+
+    if isinstance(callback.message, Message):
+        await callback.message.edit_reply_markup(
+            reply_markup=_subscription_keyboard(is_subscribed)
+        )
+
+    if is_subscribed:
+        await callback.answer("Подписка подтверждена ✅")
+    else:
+        await callback.answer(
+            "Подпишись на канал и нажми кнопку ещё раз.",
+            show_alert=True,
+        )
 
 
 @router.message(Command("help"))
@@ -44,6 +86,25 @@ async def link_handler(message: Message) -> None:
     url = extract_tiktok_url(message.text or "")
     if not url:
         await message.answer("Пришли ссылку на TikTok-пост сообщением.")
+        return
+
+    try:
+        is_subscribed = await _is_subscribed(message.bot, message.from_user.id)
+    except SubscriptionCheckError:
+        logging.exception("Could not check subscription for user %s", message.from_user.id)
+        await message.answer(
+            "Не удалось проверить подписку. Убедись, что бот добавлен администратором канала.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_subscription_keyboard(),
+        )
+        return
+
+    if not is_subscribed:
+        await message.answer(
+            _subscription_prompt(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_subscription_keyboard(False),
+        )
         return
 
     progress_message = await message.answer("Скачиваю медиа...")
@@ -101,6 +162,62 @@ async def _send_media(message: Message, media: DownloadedMedia) -> None:
 
 def _chunked(paths: list[Path], size: int) -> list[list[Path]]:
     return [paths[index:index + size] for index in range(0, len(paths), size)]
+
+
+def _channel_url() -> str:
+    username = _get_settings().required_channel_username.lstrip("@")
+    return f"https://t.me/{username}"
+
+
+def _start_text() -> str:
+    return (
+        "Привет! 👋\n"
+        "Я помогу скачать медиа из TikTok.\n"
+        "Просто отправь мне ссылку на публикацию!\n"
+        "Я умею:\n"
+        "• скачивать видео из TikTok;\n"
+        "• извлекать изображения из фотопостов;\n"
+        "• обрабатывать короткие ссылки.\n"
+        "Пришли ссылку, и я начну загрузку 🚀\n\n"
+        f"Но сначала подпишись на ➡️ <a href=\"{_channel_url()}\">канал</a> "
+        "- без этого работать ничего не будет 🤣"
+    )
+
+
+def _subscription_prompt() -> str:
+    return (
+        f"Сначала подпишись на ➡️ <a href=\"{_channel_url()}\">канал</a> "
+        "и нажми кнопку проверки подписки."
+    )
+
+
+def _subscription_keyboard(is_subscribed: bool | None = None) -> InlineKeyboardMarkup:
+    if is_subscribed is True:
+        button_text = "✅ Подписка подтверждена"
+    elif is_subscribed is False:
+        button_text = "❌ Подписка не найдена"
+    else:
+        button_text = "🔍 Проверить подписку"
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=button_text, callback_data=SUBSCRIPTION_CALLBACK)]
+        ]
+    )
+
+
+async def _is_subscribed(bot: Bot, user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(
+            chat_id=_get_settings().required_channel_username,
+            user_id=user_id,
+        )
+    except TelegramAPIError as exc:
+        raise SubscriptionCheckError from exc
+
+    if member.status in SUBSCRIBED_STATUSES:
+        return True
+    return member.status == "restricted" and bool(getattr(member, "is_member", False))
 
 
 def _get_settings() -> Settings:
