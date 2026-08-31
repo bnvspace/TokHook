@@ -1,19 +1,24 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import mimetypes
+import os
 import re
+import signal
+import socket
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from http.cookiejar import MozillaCookieJar
 from pathlib import Path
 from typing import Iterable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse, urlunparse
-from urllib.request import HTTPCookieProcessor, Request, build_opener
+from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.request import HTTPRedirectHandler, HTTPCookieProcessor, Request, build_opener
 
-from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 
 
@@ -51,6 +56,16 @@ ALLOWED_TIKTOK_HOSTS = {
     "vt.tiktok.com",
     "m.tiktok.com",
 }
+ALLOWED_MEDIA_HOST_SUFFIXES = (
+    ".tiktok.com",
+    ".tiktokcdn.com",
+    ".tiktokcdn-us.com",
+    ".tiktokv.com",
+    ".ibytedtos.com",
+    ".muscdn.com",
+    ".byteimg.com",
+    ".pstatp.com",
+)
 MAX_MEDIA_BYTES = 128 * 1024 * 1024
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_PAGE_BYTES = 16 * 1024 * 1024
@@ -107,32 +122,13 @@ def download_tiktok_media(
         if images:
             return DownloadedMedia(videos=[], images=images)
 
-    ydl_options: dict[str, object] = {
-        "paths": {"home": str(download_dir)},
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "restrictfilenames": True,
-        "windowsfilenames": True,
-        "retries": 2,
-        "fragment_retries": 2,
-        "socket_timeout": 30,
-        "max_filesize": MAX_MEDIA_BYTES,
-        "skip_unavailable_fragments": False,
-        "format": "best[ext=mp4]/best",
-        "merge_output_format": "mp4",
-    }
-
-    if cookies_path:
-        ydl_options["cookiefile"] = str(cookies_path)
-
     info: object | None = None
-    download_error: DownloadError | None = None
-    try:
-        with YoutubeDL(ydl_options) as ydl:
-            info = ydl.extract_info(normalized_url, download=True)
-    except DownloadError as exc:
-        download_error = exc
+    download_error = _run_yt_dlp(
+        normalized_url,
+        download_dir,
+        cookies_path,
+        timeout=_remaining_timeout(deadline, MAX_DOWNLOAD_SECONDS),
+    )
 
     media_files = _collect_downloaded_media(download_dir)
     if not media_files:
@@ -208,7 +204,11 @@ def resolve_tiktok_url(url: str, cookies_path: Path | None = None) -> str:
         return url
 
     try:
-        with _open_url(url, cookies_path=cookies_path) as response:
+        with _open_url(
+            url,
+            cookies_path=cookies_path,
+            allowed_redirect_hosts=ALLOWED_TIKTOK_HOSTS,
+        ) as response:
             resolved_url = response.geturl()
             if not _is_allowed_tiktok_url(resolved_url):
                 raise TikTokDownloadError(
@@ -323,6 +323,7 @@ def _download_photo_post_images(
                 cookies_path=cookies_path,
                 referer=page_url,
                 timeout=timeout,
+                public_media_only=True,
             )
             with response:
                 content = _read_response_limited(response, MAX_IMAGE_BYTES)
@@ -399,6 +400,7 @@ def _download_text(
         cookies_path=cookies_path,
         referer=referer,
         timeout=timeout,
+        allowed_redirect_hosts=ALLOWED_TIKTOK_HOSTS,
     ) as response:
         content = _read_response_limited(response, MAX_PAGE_BYTES)
         if content is None:
@@ -412,8 +414,21 @@ def _open_url(
     cookies_path: Path | None = None,
     referer: str | None = None,
     timeout: float = 30,
+    cookie_header: str | None = None,
+    allowed_redirect_hosts: set[str] | None = None,
+    public_media_only: bool = False,
 ):
-    handlers = []
+    if allowed_redirect_hosts is not None and not _host_in_set(url, allowed_redirect_hosts):
+        raise TikTokDownloadError("Ссылка ведет на недопустимый адрес.")
+    if public_media_only and not _is_allowed_media_url(url):
+        raise URLError("Media URL is not a public HTTP(S) address.")
+
+    handlers = [
+        _SafeRedirectHandler(
+            allowed_hosts=allowed_redirect_hosts,
+            public_media_only=public_media_only,
+        )
+    ]
     if cookies_path:
         cookie_jar = MozillaCookieJar()
         cookie_jar.load(str(cookies_path), ignore_discard=True, ignore_expires=True)
@@ -426,8 +441,30 @@ def _open_url(
     }
     if referer:
         headers["Referer"] = referer
+    if cookie_header:
+        headers["Cookie"] = cookie_header
     request = Request(url, headers=headers)
     return opener.open(request, timeout=timeout)
+
+
+class _SafeRedirectHandler(HTTPRedirectHandler):
+    def __init__(
+        self,
+        *,
+        allowed_hosts: set[str] | None,
+        public_media_only: bool,
+    ) -> None:
+        super().__init__()
+        self.allowed_hosts = allowed_hosts
+        self.public_media_only = public_media_only
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target_url = urljoin(req.full_url, newurl)
+        if self.allowed_hosts is not None and not _host_in_set(target_url, self.allowed_hosts):
+            raise TikTokDownloadError("Ссылка перенаправляет не на TikTok-пост.")
+        if self.public_media_only and not _is_allowed_media_url(target_url):
+            raise URLError("Media redirect is not a public HTTP(S) address.")
+        return super().redirect_request(req, fp, code, msg, headers, target_url)
 
 
 def _read_response_limited(response: object, max_bytes: int) -> bytes | None:
@@ -473,8 +510,121 @@ def _media_file_is_within_limit(path: Path) -> bool:
 
 
 def _is_allowed_tiktok_url(url: str) -> bool:
+    return _host_in_set(url, ALLOWED_TIKTOK_HOSTS)
+
+
+def _host_in_set(url: str, allowed_hosts: set[str]) -> bool:
     hostname = (urlparse(url).hostname or "").lower().rstrip(".")
-    return hostname in ALLOWED_TIKTOK_HOSTS
+    return hostname in allowed_hosts
+
+
+def _is_public_http_url(url: str) -> bool:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+
+    hostname = parsed.hostname.rstrip(".")
+    try:
+        addresses = [ipaddress.ip_address(hostname)]
+    except ValueError:
+        try:
+            addresses = [
+                ipaddress.ip_address(item[4][0])
+                for item in socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+            ]
+        except (OSError, ValueError):
+            return False
+
+    return bool(addresses) and all(address.is_global for address in addresses)
+
+
+def _is_allowed_media_url(url: str) -> bool:
+    if not _is_public_http_url(url):
+        return False
+    hostname = (urlparse(url).hostname or "").lower().rstrip(".")
+    return hostname in ALLOWED_TIKTOK_HOSTS or any(
+        hostname.endswith(suffix) for suffix in ALLOWED_MEDIA_HOST_SUFFIXES
+    )
+
+
+def _run_yt_dlp(
+    url: str,
+    download_dir: Path,
+    cookies_path: Path | None,
+    *,
+    timeout: float,
+) -> DownloadError | None:
+    if timeout <= 0:
+        return DownloadError("yt-dlp exceeded the download deadline.")
+
+    command = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "--paths",
+        str(download_dir),
+        "--no-playlist",
+        "--quiet",
+        "--no-warnings",
+        "--no-progress",
+        "--restrict-filenames",
+        "--windows-filenames",
+        "--retries",
+        "2",
+        "--fragment-retries",
+        "2",
+        "--socket-timeout",
+        "30",
+        "--max-filesize",
+        str(MAX_MEDIA_BYTES),
+        "--no-skip-unavailable-fragments",
+        "--format",
+        "best[ext=mp4]/best",
+        "--merge-output-format",
+        "mp4",
+    ]
+    if cookies_path:
+        command.extend(["--cookies", str(cookies_path)])
+    command.append(url)
+
+    popen_kwargs: dict[str, object] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    try:
+        process = subprocess.Popen(command, **popen_kwargs)
+        try:
+            stdout, stderr = process.communicate(timeout=max(1.0, timeout))
+        except subprocess.TimeoutExpired:
+            _terminate_process_tree(process)
+            process.communicate()
+            return DownloadError("yt-dlp exceeded the download deadline.")
+    except OSError as exc:
+        return DownloadError(f"Не удалось запустить yt-dlp: {exc}")
+
+    if process.returncode == 0:
+        return None
+
+    details = (stderr or stdout or "yt-dlp exited with an error").strip()
+    return DownloadError(details[-4_000:])
+
+
+def _terminate_process_tree(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            process.kill()
+        else:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        process.kill()
 
 
 def _guess_image_extension(url: str, content_type: str | None) -> str:

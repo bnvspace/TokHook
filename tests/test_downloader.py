@@ -1,4 +1,6 @@
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,6 +11,7 @@ from ttd_bot.downloader import (
     _collect_downloaded_media,
     _extract_photo_image_urls,
     _read_response_limited,
+    _run_yt_dlp,
     extract_tiktok_url,
     is_tiktok_photo_url,
     normalize_tiktok_download_url,
@@ -138,7 +141,7 @@ def test_resolve_tiktok_url_returns_redirect_target_for_short_link(monkeypatch: 
 
     monkeypatch.setattr(
         "ttd_bot.downloader._open_url",
-        lambda url, cookies_path=None, referer=None: DummyResponse(),
+        lambda url, cookies_path=None, referer=None, **kwargs: DummyResponse(),
     )
 
     assert resolve_tiktok_url("https://vt.tiktok.com/ZS9n2pqYV/") == (
@@ -159,7 +162,7 @@ def test_resolve_tiktok_url_rejects_external_redirect(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(
         "ttd_bot.downloader._open_url",
-        lambda url, cookies_path=None, referer=None: DummyResponse(),
+        lambda url, cookies_path=None, referer=None, **kwargs: DummyResponse(),
     )
 
     with pytest.raises(TikTokDownloadError, match="перенаправляет"):
@@ -174,6 +177,61 @@ def test_read_response_limited_stops_after_limit() -> None:
             return b"x" * (size + 1)
 
     assert _read_response_limited(DummyResponse(), 16) is None
+
+
+def test_safe_redirect_handler_rejects_external_target() -> None:
+    from ttd_bot.downloader import _SafeRedirectHandler
+
+    handler = _SafeRedirectHandler(
+        allowed_hosts={"tiktok.com"},
+        public_media_only=False,
+    )
+
+    with pytest.raises(TikTokDownloadError, match="перенаправляет"):
+        handler.redirect_request(
+            SimpleNamespace(full_url="https://vt.tiktok.com/short/"),
+            None,
+            302,
+            "Found",
+            {},
+            "https://example.com/redirected",
+        )
+
+
+def test_run_yt_dlp_stops_after_deadline(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    class FakeProcess:
+        pid = 123
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def communicate(self, timeout=None):
+            if timeout is not None:
+                raise subprocess.TimeoutExpired("yt_dlp", timeout)
+            return "", ""
+
+    process = FakeProcess()
+    terminated: list[object] = []
+    monkeypatch.setattr(
+        "ttd_bot.downloader.subprocess.Popen",
+        lambda *args, **kwargs: process,
+    )
+    monkeypatch.setattr(
+        "ttd_bot.downloader._terminate_process_tree",
+        lambda value: terminated.append(value),
+    )
+
+    error = _run_yt_dlp(
+        "https://www.tiktok.com/@name/video/42",
+        tmp_path,
+        None,
+        timeout=1,
+    )
+
+    assert error is not None
+    assert "deadline" in str(error)
+    assert terminated == [process]
 
 
 def test_collect_media_ignores_oversize_files_and_external_paths(tmp_path: Path) -> None:

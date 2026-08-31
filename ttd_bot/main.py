@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -25,7 +26,8 @@ from ttd_bot.downloader import DownloadedMedia, TikTokDownloadError, download_ti
 
 router = Router()
 SETTINGS: Settings | None = None
-TEMP_ROOT = Path(__file__).resolve().parents[1] / "tmp"
+_DEFAULT_TEMP_ROOT = Path(__file__).resolve().parents[1] / "tmp"
+TEMP_ROOT = Path(os.getenv("TTD_TEMP_ROOT", str(_DEFAULT_TEMP_ROOT))).expanduser()
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(2)
 ACTIVE_USERS: set[int] = set()
 ACTIVE_USERS_LOCK = asyncio.Lock()

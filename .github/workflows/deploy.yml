@@ -86,6 +86,9 @@ jobs:
           releases_dir="$APP_DIR/releases"
           current_link="$APP_DIR/current"
           stage_dir="$releases_dir/.${RELEASE_SHA}.staging.$$"
+          service_unit="/etc/systemd/system/$SERVICE_NAME"
+          previous_service_unit="$APP_DIR/.${SERVICE_NAME}.previous"
+          previous_service_exists=false
           previous_target="$(readlink "$current_link" 2>/dev/null || true)"
           mkdir -p "$releases_dir"
           rm -rf -- "$stage_dir"
@@ -123,9 +126,13 @@ jobs:
             XDG_CACHE_HOME="$APP_DIR/.cache" \
             "$APP_DIR/.venv/bin/python3" -m camoufox fetch
 
+          if [ -f "$service_unit" ]; then
+            cp -a "$service_unit" "$previous_service_unit"
+            previous_service_exists=true
+          fi
           install -o root -g root -m 644 \
             "$stage_dir/deploy/ttd-bot.service" \
-            /etc/systemd/system/ttd-bot.service
+            "$service_unit"
           systemctl daemon-reload
 
           if [ "$previous_target" = "$release_dir" ] && [ -f "$release_dir/ttd_bot/main.py" ]; then
@@ -142,11 +149,23 @@ jobs:
             if [ -n "$previous_target" ] && [ -d "$previous_target" ]; then
               ln -sfn "$previous_target" "$APP_DIR/.current.rollback"
               mv -Tf "$APP_DIR/.current.rollback" "$current_link"
-              systemctl restart "$SERVICE_NAME" || true
             else
               rm -f -- "$current_link"
+            fi
+            if [ "$previous_service_exists" = true ]; then
+              install -o root -g root -m 644 "$previous_service_unit" "$service_unit"
+              systemctl daemon-reload
+              systemctl restart "$SERVICE_NAME" || true
+            else
+              rm -f -- "$service_unit"
+              systemctl daemon-reload
               systemctl stop "$SERVICE_NAME" || true
             fi
+            rm -f -- "$previous_service_unit"
+            if [ -d "$release_dir" ] && [ "$release_dir" != "$previous_target" ]; then
+              rm -rf -- "$release_dir"
+            fi
+            rm -rf -- "$stage_dir"
             exit 1
           }
 
@@ -172,6 +191,15 @@ jobs:
 
           printf '%s\n' "$RELEASE_SHA" > "$APP_DIR/deployed_sha"
           chmod 644 "$APP_DIR/deployed_sha"
+          rm -f -- "$previous_service_unit"
+          find "$releases_dir" -mindepth 1 -maxdepth 1 -type d \
+            -name '[0-9a-f]*' -printf '%T@ %p\n' \
+            | sort -nr | tail -n +6 | cut -d' ' -f2- \
+            | while IFS= read -r old_release; do
+                if [ "$old_release" != "$release_dir" ]; then
+                  rm -rf -- "$old_release"
+                fi
+              done
           systemctl show "$SERVICE_NAME" \
             -p ActiveState -p SubState -p MainPID --no-pager
 

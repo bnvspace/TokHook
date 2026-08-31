@@ -19,6 +19,8 @@ from ttd_bot.downloader import (
     MAX_PHOTO_IMAGES,
     UNIVERSAL_DATA_RE,
     VIDEO_EXTENSIONS,
+    _open_url,
+    _read_response_limited,
     _remaining_timeout,
 )
 
@@ -195,7 +197,6 @@ def _download_media_urls(
 ) -> DownloadedMedia:
     videos: list[Path] = []
     images: list[Path] = []
-    request_context = context.request
     headers = {
         "Referer": referer,
         "User-Agent": BROWSER_USER_AGENT,
@@ -206,7 +207,7 @@ def _download_media_urls(
         if _remaining_timeout(deadline, 60) <= 0:
             break
         media_path = _download_one_media(
-            request_context,
+            context,
             url,
             download_dir / f"video_{index:02d}",
             headers=headers,
@@ -221,7 +222,7 @@ def _download_media_urls(
         if _remaining_timeout(deadline, 60) <= 0:
             break
         media_path = _download_one_media(
-            request_context,
+            context,
             url,
             download_dir / f"image_{index:02d}",
             headers=headers,
@@ -235,7 +236,7 @@ def _download_media_urls(
 
 
 def _download_one_media(
-    request_context: object,
+    context: object,
     url: str,
     target_without_extension: Path,
     *,
@@ -244,26 +245,22 @@ def _download_one_media(
     timeout: float,
 ) -> Path | None:
     try:
-        response = request_context.get(
+        cookie_header = _browser_cookie_header(context, url)
+        response = _open_url(
             url,
-            headers=headers,
-            timeout=int(timeout * 1000),
-            fail_on_status_code=False,
+            referer=headers["Referer"],
+            timeout=timeout,
+            cookie_header=cookie_header,
+            public_media_only=True,
         )
-        if not response.ok:
+        status = getattr(response, "status", None) or response.getcode()
+        if status and status >= 400:
             return None
 
         max_bytes = MAX_IMAGE_BYTES if allowed_extensions == IMAGE_EXTENSIONS else MAX_MEDIA_BYTES
-        content_length = response.headers.get("content-length")
-        if content_length:
-            try:
-                if int(content_length) > max_bytes:
-                    return None
-            except ValueError:
-                pass
-
-        content = response.body()
-        if not content or len(content) > max_bytes:
+        with response:
+            content = _read_response_limited(response, max_bytes)
+        if not content:
             return None
 
         extension = _guess_media_extension(
@@ -281,6 +278,19 @@ def _download_one_media(
     except Exception:
         LOGGER.warning("Camoufox media request failed for %s", _safe_url(url))
         return None
+
+
+def _browser_cookie_header(context: object, url: str) -> str | None:
+    try:
+        cookies = context.cookies(url)
+    except Exception:
+        return None
+    pairs = [
+        f"{cookie['name']}={cookie['value']}"
+        for cookie in cookies
+        if isinstance(cookie, dict) and cookie.get("name") and cookie.get("value")
+    ]
+    return "; ".join(pairs) or None
 
 
 def _guess_media_extension(
