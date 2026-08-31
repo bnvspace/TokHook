@@ -4,6 +4,7 @@ import json
 import logging
 import mimetypes
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -34,6 +35,7 @@ from ttd_bot.downloader import (
 LOGGER = logging.getLogger(__name__)
 _CAMOUFOX_LOCK = Lock()
 MAX_VIDEO_CANDIDATES = 8
+MAX_CAMOUFOX_SECONDS = 60
 
 
 class CamoufoxUnavailable(RuntimeError):
@@ -63,7 +65,10 @@ def download_tiktok_media_with_camoufox(
 
     if deadline is None:
         deadline = time.monotonic() + MAX_DOWNLOAD_SECONDS
-    remaining = _remaining_timeout(deadline, MAX_DOWNLOAD_SECONDS)
+    remaining = min(
+        MAX_CAMOUFOX_SECONDS,
+        _remaining_timeout(deadline, MAX_DOWNLOAD_SECONDS),
+    )
     if remaining <= 0 or not _CAMOUFOX_LOCK.acquire(timeout=remaining):
         return DownloadedMedia(videos=[], images=[])
     try:
@@ -473,6 +478,7 @@ def _worker_main(arguments: list[str]) -> int:
     from camoufox.sync_api import Camoufox
 
     page_url, download_dir, profile_dir, timeout_text = arguments[1:]
+    _set_parent_death_signal()
     deadline = time.monotonic() + max(0.01, float(timeout_text))
     _download_with_camoufox(
         Camoufox,
@@ -482,6 +488,20 @@ def _worker_main(arguments: list[str]) -> int:
         deadline=deadline,
     )
     return 0
+
+
+def _set_parent_death_signal() -> None:
+    """Kill Camoufox descendants if the isolated worker is forcibly stopped."""
+
+    if os.name == "nt":
+        return
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None)
+        libc.prctl(1, getattr(signal, "SIGKILL", 9))
+    except (AttributeError, OSError):
+        LOGGER.warning("Could not configure Camoufox parent-death cleanup")
 
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--worker":
