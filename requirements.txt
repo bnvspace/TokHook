@@ -1,5 +1,6 @@
 aiogram==3.27.0
 python-dotenv==1.2.2
 yt-dlp==2026.8.19
+curl_cffi==0.15.0
 camoufox==0.5.5
 pytest==8.4.2

@@ -12,9 +12,11 @@ blessed==1.49.0
 browserforge==1.2.4
 camoufox==0.5.5
 certifi==2026.7.22
+cffi==2.1.1
 charset-normalizer==3.5.1
 click==8.5.0
 colorama==0.4.6
+curl_cffi==0.15.0
 editor==1.8.0
 frozenlist==1.8.0
 greenlet==3.5.5
@@ -37,6 +39,7 @@ pluggy==1.6.0
 propcache==0.5.2
 pydantic==2.12.5
 pydantic_core==2.41.5
+pycparser==3.0
 pyee==13.0.1
 Pygments==2.21.0
 PySocks==1.7.1
