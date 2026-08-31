@@ -65,11 +65,6 @@ async def subscription_callback_handler(callback: CallbackQuery) -> None:
         )
         return
 
-    if isinstance(callback.message, Message):
-        await callback.message.edit_reply_markup(
-            reply_markup=_subscription_keyboard(is_subscribed)
-        )
-
     if is_subscribed:
         await callback.answer("Подписка подтверждена ✅")
         await callback.bot.send_message(
@@ -81,6 +76,11 @@ async def subscription_callback_handler(callback: CallbackQuery) -> None:
             "Подпишись на канал и нажми кнопку ещё раз.",
             show_alert=True,
         )
+
+    if isinstance(callback.message, Message):
+        new_markup = _subscription_keyboard(is_subscribed)
+        if _subscription_button_state(callback.message) is not is_subscribed:
+            await callback.message.edit_reply_markup(reply_markup=new_markup)
 
 
 @router.message(Command("help"))
@@ -212,6 +212,19 @@ def _subscription_keyboard(is_subscribed: bool | None = None) -> InlineKeyboardM
             [InlineKeyboardButton(text=button_text, callback_data=SUBSCRIPTION_CALLBACK)]
         ]
     )
+
+
+def _subscription_button_state(message: Message) -> bool | None:
+    markup = message.reply_markup
+    if not markup or not markup.inline_keyboard or not markup.inline_keyboard[0]:
+        return None
+
+    button_text = markup.inline_keyboard[0][0].text or ""
+    if button_text.startswith("✅"):
+        return True
+    if button_text.startswith("❌"):
+        return False
+    return None
 
 
 async def _is_subscribed(bot: Bot, user_id: int) -> bool:
