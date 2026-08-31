@@ -1,0 +1,113 @@
+name: TTD CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ttd-production
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Run tests
+        run: python -m pytest -q
+
+  deploy:
+    name: Deploy to VPS
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+      VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+      APP_DIR: /opt/ttd-bot
+      SERVICE_NAME: ttd-bot.service
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$VPS_HOST"
+          test -n "$VPS_USER"
+          test -n "$VPS_SSH_KEY"
+          test -n "$VPS_KNOWN_HOSTS"
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$VPS_SSH_KEY" > "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$VPS_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
+
+      - name: Package source
+        shell: bash
+        run: tar -czf "/tmp/ttd-bot-${GITHUB_SHA}.tar.gz" ttd_bot requirements.txt
+
+      - name: Upload source
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="/tmp/ttd-bot-${GITHUB_SHA}.tar.gz"
+          scp -q -P 22 "$archive" "$VPS_USER@$VPS_HOST:/tmp/"
+
+      - name: Install and restart service
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="ttd-bot-${GITHUB_SHA}.tar.gz"
+          ssh -p 22 "$VPS_USER@$VPS_HOST" \
+            "ARCHIVE='$archive' RELEASE_SHA='$GITHUB_SHA' APP_DIR='$APP_DIR' SERVICE_NAME='$SERVICE_NAME' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          release_dir="$APP_DIR/.deploy/$RELEASE_SHA"
+          mkdir -p "$APP_DIR/.deploy"
+          rm -rf -- "$release_dir"
+          mkdir -p "$release_dir"
+          tar -xzf "/tmp/$ARCHIVE" -C "$release_dir"
+          test -f "$release_dir/requirements.txt"
+          test -f "$release_dir/ttd_bot/main.py"
+
+          "$APP_DIR/.venv/bin/python3" -m pip install \
+            --disable-pip-version-check \
+            -r "$release_dir/requirements.txt"
+
+          mkdir -p "$APP_DIR/ttd_bot"
+          cp -a "$release_dir/ttd_bot/." "$APP_DIR/ttd_bot/"
+          cp "$release_dir/requirements.txt" "$APP_DIR/requirements.txt"
+
+          systemctl restart "$SERVICE_NAME"
+          for attempt in 1 2 3 4 5; do
+            if systemctl is-active --quiet "$SERVICE_NAME"; then
+              break
+            fi
+            sleep 2
+          done
+          systemctl is-active --quiet "$SERVICE_NAME"
+          systemctl show "$SERVICE_NAME" \
+            -p ActiveState -p SubState -p MainPID --no-pager
+
+          rm -rf -- "$release_dir" "/tmp/$ARCHIVE"
+          REMOTE
