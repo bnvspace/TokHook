@@ -722,17 +722,58 @@ def _terminate_process_tree(process: subprocess.Popen) -> None:
                 timeout=5,
             )
         else:
+            descendants = _descendant_pids(process.pid)
             process_group = getattr(process, "_ttd_process_group", None)
             if process_group is None:
                 if process.poll() is not None:
-                    return
-                process_group = os.getpgid(process.pid)
-            os.killpg(process_group, signal.SIGKILL)
+                    process_group = None
+                else:
+                    process_group = os.getpgid(process.pid)
+            if process_group is not None:
+                try:
+                    os.killpg(process_group, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            for descendant in descendants:
+                try:
+                    os.kill(descendant, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
     except (OSError, ProcessLookupError, subprocess.TimeoutExpired):
         try:
             process.kill()
         except OSError:
             pass
+
+
+def _descendant_pids(root_pid: int) -> list[int]:
+    """Find descendants even when a browser creates a separate process group."""
+
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return []
+
+    children: dict[int, list[int]] = {}
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            status = (entry / "stat").read_text(encoding="utf-8")
+        except OSError:
+            continue
+        match = re.match(r"^\d+ \(.*\) \S+ (\d+) ", status)
+        if match is None:
+            continue
+        parent_pid = int(match.group(1))
+        children.setdefault(parent_pid, []).append(int(entry.name))
+
+    descendants: list[int] = []
+    pending = list(children.get(root_pid, []))
+    while pending:
+        pid = pending.pop()
+        descendants.append(pid)
+        pending.extend(children.get(pid, []))
+    return descendants
 
 
 def _reap_process(process: subprocess.Popen) -> bool:
