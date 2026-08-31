@@ -71,6 +71,7 @@ MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_PAGE_BYTES = 16 * 1024 * 1024
 MAX_PHOTO_IMAGES = 35
 MAX_DOWNLOAD_SECONDS = 180
+MAX_REDIRECTS = 5
 
 
 class TikTokDownloadError(RuntimeError):
@@ -109,7 +110,12 @@ def download_tiktok_media(
 
     download_dir.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + MAX_DOWNLOAD_SECONDS
-    resolved_url = resolve_tiktok_url(url, cookies_path)
+    resolved_url = resolve_tiktok_url(
+        url,
+        cookies_path,
+        timeout=_remaining_timeout(deadline, 30),
+        deadline=deadline,
+    )
     normalized_url = normalize_tiktok_download_url(resolved_url)
 
     if is_tiktok_photo_url(resolved_url):
@@ -198,16 +204,26 @@ def normalize_tiktok_download_url(url: str) -> str:
     return urlunparse(parsed._replace(path=normalized_path, query="", fragment=""))
 
 
-def resolve_tiktok_url(url: str, cookies_path: Path | None = None) -> str:
+def resolve_tiktok_url(
+    url: str,
+    cookies_path: Path | None = None,
+    *,
+    timeout: float = 30,
+    deadline: float | None = None,
+) -> str:
     parsed = urlparse(url)
     if TIKTOK_POST_PATH_RE.match(parsed.path):
+        return url
+    if timeout <= 0:
         return url
 
     try:
         with _open_url(
             url,
             cookies_path=cookies_path,
+            timeout=timeout,
             allowed_redirect_hosts=ALLOWED_TIKTOK_HOSTS,
+            deadline=deadline,
         ) as response:
             resolved_url = response.geturl()
             if not _is_allowed_tiktok_url(resolved_url):
@@ -304,6 +320,7 @@ def _download_photo_post_images(
             page_url,
             cookies_path=cookies_path,
             timeout=_remaining_timeout(deadline, 30),
+            deadline=deadline,
         )
     except (HTTPError, URLError, OSError):
         return []
@@ -324,9 +341,14 @@ def _download_photo_post_images(
                 referer=page_url,
                 timeout=timeout,
                 public_media_only=True,
+                deadline=deadline,
             )
             with response:
-                content = _read_response_limited(response, MAX_IMAGE_BYTES)
+                content = _read_response_limited(
+                    response,
+                    MAX_IMAGE_BYTES,
+                    deadline=deadline,
+                )
                 if not content:
                     continue
                 extension = _guess_image_extension(image_url, response.headers.get("Content-Type"))
@@ -394,6 +416,7 @@ def _download_text(
     cookies_path: Path | None = None,
     referer: str | None = None,
     timeout: float = 30,
+    deadline: float | None = None,
 ) -> str:
     with _open_url(
         url,
@@ -401,8 +424,9 @@ def _download_text(
         referer=referer,
         timeout=timeout,
         allowed_redirect_hosts=ALLOWED_TIKTOK_HOSTS,
+        deadline=deadline,
     ) as response:
-        content = _read_response_limited(response, MAX_PAGE_BYTES)
+        content = _read_response_limited(response, MAX_PAGE_BYTES, deadline=deadline)
         if content is None:
             raise OSError("TikTok page exceeds the configured size limit.")
         return content.decode("utf-8", "replace")
@@ -417,7 +441,13 @@ def _open_url(
     cookie_header: str | None = None,
     allowed_redirect_hosts: set[str] | None = None,
     public_media_only: bool = False,
+    deadline: float | None = None,
 ):
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise URLError("Request exceeded the download deadline.")
+        timeout = min(timeout, remaining)
     if allowed_redirect_hosts is not None and not _host_in_set(url, allowed_redirect_hosts):
         raise TikTokDownloadError("Ссылка ведет на недопустимый адрес.")
     if public_media_only and not _is_allowed_media_url(url):
@@ -427,6 +457,7 @@ def _open_url(
         _SafeRedirectHandler(
             allowed_hosts=allowed_redirect_hosts,
             public_media_only=public_media_only,
+            deadline=deadline,
         )
     ]
     if cookies_path:
@@ -448,26 +479,46 @@ def _open_url(
 
 
 class _SafeRedirectHandler(HTTPRedirectHandler):
+    handler_order = 499
+
     def __init__(
         self,
         *,
         allowed_hosts: set[str] | None,
         public_media_only: bool,
+        deadline: float | None = None,
     ) -> None:
         super().__init__()
         self.allowed_hosts = allowed_hosts
         self.public_media_only = public_media_only
+        self.deadline = deadline
+        self.redirect_count = 0
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        remaining: float | None = None
+        if self.deadline is not None:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise URLError("Redirect chain exceeded the download deadline.")
+        if self.redirect_count >= MAX_REDIRECTS:
+            raise URLError("Redirect chain exceeded the configured limit.")
+        self.redirect_count += 1
         target_url = urljoin(req.full_url, newurl)
         if self.allowed_hosts is not None and not _host_in_set(target_url, self.allowed_hosts):
             raise TikTokDownloadError("Ссылка перенаправляет не на TikTok-пост.")
         if self.public_media_only and not _is_allowed_media_url(target_url):
             raise URLError("Media redirect is not a public HTTP(S) address.")
+        if remaining is not None:
+            req.timeout = max(0.01, remaining)
         return super().redirect_request(req, fp, code, msg, headers, target_url)
 
 
-def _read_response_limited(response: object, max_bytes: int) -> bytes | None:
+def _read_response_limited(
+    response: object,
+    max_bytes: int,
+    *,
+    deadline: float | None = None,
+) -> bytes | None:
     content_length = response.headers.get("Content-Length")
     if content_length:
         try:
@@ -479,6 +530,12 @@ def _read_response_limited(response: object, max_bytes: int) -> bytes | None:
     chunks: list[bytes] = []
     total = 0
     while True:
+        remaining: float | None = None
+        if deadline is not None and time.monotonic() >= deadline:
+            return None
+        if deadline is not None:
+            remaining = max(0.001, deadline - time.monotonic())
+            _set_response_timeout(response, remaining)
         chunk = response.read(min(64 * 1024, max_bytes - total + 1))
         if not chunk:
             break
@@ -487,6 +544,24 @@ def _read_response_limited(response: object, max_bytes: int) -> bytes | None:
         if total > max_bytes:
             return None
     return b"".join(chunks)
+
+
+def _set_response_timeout(response: object, timeout: float) -> None:
+    """Best-effort timeout update for urllib's underlying socket."""
+
+    candidates = [
+        getattr(response, "fp", None),
+        getattr(getattr(response, "fp", None), "raw", None),
+        getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None),
+    ]
+    for candidate in candidates:
+        setter = getattr(candidate, "settimeout", None)
+        if callable(setter):
+            try:
+                setter(timeout)
+            except OSError:
+                pass
+            return
 
 
 def _remaining_timeout(deadline: float, default: float) -> float:
@@ -600,10 +675,24 @@ def _run_yt_dlp(
     try:
         process = subprocess.Popen(command, **popen_kwargs)
         try:
-            stdout, stderr = process.communicate(timeout=max(1.0, timeout))
+            stdout, stderr = process.communicate(timeout=max(0.01, timeout))
         except subprocess.TimeoutExpired:
             _terminate_process_tree(process)
-            process.communicate()
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                _terminate_process_tree(process)
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+                _reap_process(process)
+                for stream in (
+                    getattr(process, "stdout", None),
+                    getattr(process, "stderr", None),
+                ):
+                    if stream is not None:
+                        stream.close()
             return DownloadError("yt-dlp exceeded the download deadline.")
     except OSError as exc:
         return DownloadError(f"Не удалось запустить yt-dlp: {exc}")
@@ -620,11 +709,42 @@ def _terminate_process_tree(process: subprocess.Popen) -> None:
         return
     try:
         if os.name == "nt":
-            process.kill()
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=5,
+            )
         else:
             os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-    except (OSError, ProcessLookupError):
-        process.kill()
+    except (OSError, ProcessLookupError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+def _reap_process(process: subprocess.Popen) -> bool:
+    """Reap a killed child within a bounded interval."""
+
+    wait = getattr(process, "wait", None)
+    if not callable(wait):
+        return False
+    try:
+        wait(timeout=1)
+        return True
+    except (subprocess.TimeoutExpired, OSError):
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            wait(timeout=1)
+            return True
+        except (subprocess.TimeoutExpired, OSError):
+            LOGGER.error("Could not reap timed-out yt-dlp process %s", process.pid)
+            return False
 
 
 def _guess_image_extension(url: str, content_type: str | None) -> str:

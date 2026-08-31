@@ -6,7 +6,7 @@ import mimetypes
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Timer
 from urllib.parse import urlparse
 
 from ttd_bot.downloader import (
@@ -20,8 +20,8 @@ from ttd_bot.downloader import (
     UNIVERSAL_DATA_RE,
     VIDEO_EXTENSIONS,
     _open_url,
-    _read_response_limited,
     _remaining_timeout,
+    _set_response_timeout,
 )
 
 
@@ -32,6 +32,15 @@ MAX_VIDEO_CANDIDATES = 8
 
 class CamoufoxUnavailable(RuntimeError):
     """Raised when the optional browser fallback is not installed."""
+
+
+def _abort_camoufox_page(page: object) -> None:
+    """Best-effort watchdog abort for sync Playwright calls without a timeout arg."""
+
+    try:
+        page.close()
+    except Exception:
+        LOGGER.warning("Camoufox watchdog could not close the page")
 
 
 @dataclass(slots=True)
@@ -55,11 +64,12 @@ def download_tiktok_media_with_camoufox(
             "Camoufox не установлен в окружении бота."
         ) from exc
 
-    with _CAMOUFOX_LOCK:
-        if deadline is None:
-            deadline = time.monotonic() + MAX_DOWNLOAD_SECONDS
-        if deadline <= time.monotonic():
-            return DownloadedMedia(videos=[], images=[])
+    if deadline is None:
+        deadline = time.monotonic() + MAX_DOWNLOAD_SECONDS
+    remaining = _remaining_timeout(deadline, MAX_DOWNLOAD_SECONDS)
+    if remaining <= 0 or not _CAMOUFOX_LOCK.acquire(timeout=remaining):
+        return DownloadedMedia(videos=[], images=[])
+    try:
         return _download_with_camoufox(
             Camoufox,
             page_url=page_url,
@@ -67,6 +77,8 @@ def download_tiktok_media_with_camoufox(
             profile_dir=profile_dir,
             deadline=deadline,
         )
+    finally:
+        _CAMOUFOX_LOCK.release()
 
 
 def _download_with_camoufox(
@@ -87,42 +99,70 @@ def _download_with_camoufox(
         user_data_dir=str(profile_dir),
     ) as context:
         page = context.pages[0] if context.pages else context.new_page()
-        page.set_default_timeout(15_000)
-        page.set_default_navigation_timeout(60_000)
-
-        try:
-            page.goto(
-                page_url,
-                wait_until="domcontentloaded",
-                timeout=max(100, int(_remaining_timeout(deadline, 60) * 1000)),
-            )
-        except Exception:
-            # TikTok may keep a challenge request open after the useful page state
-            # has already arrived. The DOM is still worth inspecting below.
-            LOGGER.warning("Camoufox navigation did not finish for %s", page_url)
-
-        page.wait_for_timeout(int(min(3_500, _remaining_timeout(deadline, 3.5) * 1000)))
-        webpage = page.content()
-        candidates = _extract_media_urls(webpage)
-
-        for locator in ("video", "source"):
-            for index in range(page.locator(locator).count()):
-                element = page.locator(locator).nth(index)
-                for attribute in ("src", "data-src"):
-                    value = element.get_attribute(attribute)
-                    if value and value.startswith("http"):
-                        candidates.videos.append(value)
-
-        candidates = _deduplicate_media_urls(candidates)
-        candidates.videos = candidates.videos[:MAX_VIDEO_CANDIDATES]
-        candidates.images = candidates.images[:MAX_PHOTO_IMAGES]
-        return _download_media_urls(
-            context,
-            candidates,
-            download_dir=download_dir,
-            referer=page_url,
-            deadline=deadline,
+        watchdog = Timer(
+            max(0.0, deadline - time.monotonic()),
+            _abort_camoufox_page,
+            args=(page,),
         )
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            page.set_default_timeout(15_000)
+            page.set_default_navigation_timeout(60_000)
+
+            try:
+                navigation_timeout = _remaining_timeout(deadline, 60)
+                if navigation_timeout <= 0:
+                    return DownloadedMedia(videos=[], images=[])
+                page.goto(
+                    page_url,
+                    wait_until="domcontentloaded",
+                    timeout=max(1, int(navigation_timeout * 1000)),
+                )
+            except Exception:
+                # TikTok may keep a challenge request open after the useful page state
+                # has already arrived. The DOM is still worth inspecting below.
+                LOGGER.warning("Camoufox navigation did not finish for %s", page_url)
+
+            remaining = _remaining_timeout(deadline, 15)
+            if remaining <= 0:
+                return DownloadedMedia(videos=[], images=[])
+            page.set_default_timeout(max(1, int(remaining * 1000)))
+            page.wait_for_timeout(int(min(3_500, remaining * 1000)))
+            if _remaining_timeout(deadline, 15) <= 0:
+                return DownloadedMedia(videos=[], images=[])
+            webpage = page.content()
+            if _remaining_timeout(deadline, 15) <= 0:
+                return DownloadedMedia(videos=[], images=[])
+            candidates = _extract_media_urls(webpage)
+
+            for locator in ("video", "source"):
+                if _remaining_timeout(deadline, 15) <= 0:
+                    break
+                elements = page.locator(locator)
+                for index in range(elements.count()):
+                    if _remaining_timeout(deadline, 15) <= 0:
+                        break
+                    element = elements.nth(index)
+                    for attribute in ("src", "data-src"):
+                        if _remaining_timeout(deadline, 15) <= 0:
+                            break
+                        value = element.get_attribute(attribute)
+                        if value and value.startswith("http"):
+                            candidates.videos.append(value)
+
+            candidates = _deduplicate_media_urls(candidates)
+            candidates.videos = candidates.videos[:MAX_VIDEO_CANDIDATES]
+            candidates.images = candidates.images[:MAX_PHOTO_IMAGES]
+            return _download_media_urls(
+                context,
+                candidates,
+                download_dir=download_dir,
+                referer=page_url,
+                deadline=deadline,
+            )
+        finally:
+            watchdog.cancel()
 
 
 def _extract_media_urls(webpage: str) -> _MediaUrls:
@@ -213,6 +253,7 @@ def _download_media_urls(
             headers=headers,
             allowed_extensions=VIDEO_EXTENSIONS,
             timeout=_remaining_timeout(deadline, 60),
+            deadline=deadline,
         )
         if media_path:
             videos.append(media_path)
@@ -228,6 +269,7 @@ def _download_media_urls(
             headers=headers,
             allowed_extensions=IMAGE_EXTENSIONS,
             timeout=_remaining_timeout(deadline, 60),
+            deadline=deadline,
         )
         if media_path:
             images.append(media_path)
@@ -243,6 +285,7 @@ def _download_one_media(
     headers: dict[str, str],
     allowed_extensions: set[str],
     timeout: float,
+    deadline: float,
 ) -> Path | None:
     try:
         cookie_header = _browser_cookie_header(context, url)
@@ -252,6 +295,7 @@ def _download_one_media(
             timeout=timeout,
             cookie_header=cookie_header,
             public_media_only=True,
+            deadline=deadline,
         )
         status = getattr(response, "status", None) or response.getcode()
         if status and status >= 400:
@@ -259,25 +303,68 @@ def _download_one_media(
 
         max_bytes = MAX_IMAGE_BYTES if allowed_extensions == IMAGE_EXTENSIONS else MAX_MEDIA_BYTES
         with response:
-            content = _read_response_limited(response, max_bytes)
-        if not content:
-            return None
+            return _save_response_limited(
+                response,
+                url,
+                target_without_extension,
+                response.headers.get("content-type"),
+                allowed_extensions,
+                max_bytes,
+                deadline,
+            )
+    except Exception:
+        LOGGER.warning("Camoufox media request failed for %s", _safe_url(url))
+        return None
 
+
+def _save_response_limited(
+    response: object,
+    url: str,
+    target_without_extension: Path,
+    content_type: str | None,
+    allowed_extensions: set[str],
+    max_bytes: int,
+    deadline: float | None = None,
+) -> Path | None:
+    """Stream a browser-discovered media response without buffering it in RAM."""
+
+    part_path = target_without_extension.with_name(target_without_extension.name + ".part")
+    total_bytes = 0
+    prefix = bytearray()
+    try:
+        with part_path.open("wb") as output:
+            while True:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return None
+                    _set_response_timeout(response, max(0.001, remaining))
+                chunk = response.read(64 * 1024)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > max_bytes:
+                    return None
+                if len(prefix) < 512:
+                    prefix.extend(chunk[: 512 - len(prefix)])
+                output.write(chunk)
+
+        if total_bytes == 0:
+            return None
         extension = _guess_media_extension(
             url,
-            response.headers.get("content-type"),
+            content_type,
             allowed_extensions,
-            content,
+            bytes(prefix),
         )
         if extension is None:
             return None
 
         target_path = target_without_extension.with_suffix(extension)
-        target_path.write_bytes(content)
+        part_path.replace(target_path)
         return target_path
-    except Exception:
-        LOGGER.warning("Camoufox media request failed for %s", _safe_url(url))
-        return None
+    finally:
+        part_path.unlink(missing_ok=True)
 
 
 def _browser_cookie_header(context: object, url: str) -> str | None:

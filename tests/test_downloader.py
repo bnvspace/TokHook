@@ -6,6 +6,7 @@ import pytest
 
 from ttd_bot.downloader import (
     MAX_IMAGE_BYTES,
+    MAX_MEDIA_BYTES,
     TikTokDownloadError,
     _collect_media_from_info,
     _collect_downloaded_media,
@@ -17,7 +18,7 @@ from ttd_bot.downloader import (
     normalize_tiktok_download_url,
     resolve_tiktok_url,
 )
-from ttd_bot.camoufox_fallback import _extract_media_urls
+from ttd_bot.camoufox_fallback import _extract_media_urls, _save_response_limited
 
 
 @pytest.mark.parametrize(
@@ -179,6 +180,47 @@ def test_read_response_limited_stops_after_limit() -> None:
     assert _read_response_limited(DummyResponse(), 16) is None
 
 
+def test_save_response_limited_streams_and_validates_media(tmp_path: Path) -> None:
+    class DummyResponse:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self.chunks = iter(chunks)
+
+        def read(self, size: int) -> bytes:
+            return next(self.chunks, b"")
+
+    target = _save_response_limited(
+        DummyResponse([b"\x00\x00\x00\x18ftyp", b"mp42payload"]),
+        "https://cdn.tiktokcdn.com/video",
+        tmp_path / "video_01",
+        "video/mp4",
+        {".mp4", ".mov", ".webm", ".mkv"},
+        MAX_MEDIA_BYTES,
+    )
+
+    assert target is not None
+    assert target.suffix == ".mp4"
+    assert target.read_bytes() == b"\x00\x00\x00\x18ftypmp42payload"
+    assert not (tmp_path / "video_01.part").exists()
+
+
+def test_save_response_limited_removes_oversized_partial_file(tmp_path: Path) -> None:
+    class DummyResponse:
+        def read(self, size: int) -> bytes:
+            return b"0123456789"
+
+    target = _save_response_limited(
+        DummyResponse(),
+        "https://cdn.tiktokcdn.com/image.jpg",
+        tmp_path / "image_01",
+        "image/jpeg",
+        {".jpg", ".jpeg", ".png", ".webp"},
+        4,
+    )
+
+    assert target is None
+    assert not (tmp_path / "image_01.part").exists()
+
+
 def test_safe_redirect_handler_rejects_external_target() -> None:
     from ttd_bot.downloader import _SafeRedirectHandler
 
@@ -206,6 +248,9 @@ def test_run_yt_dlp_stops_after_deadline(monkeypatch: pytest.MonkeyPatch, tmp_pa
         def poll(self):
             return None
 
+        def kill(self):
+            self.returncode = -9
+
         def communicate(self, timeout=None):
             if timeout is not None:
                 raise subprocess.TimeoutExpired("yt_dlp", timeout)
@@ -231,7 +276,7 @@ def test_run_yt_dlp_stops_after_deadline(monkeypatch: pytest.MonkeyPatch, tmp_pa
 
     assert error is not None
     assert "deadline" in str(error)
-    assert terminated == [process]
+    assert terminated == [process, process]
 
 
 def test_collect_media_ignores_oversize_files_and_external_paths(tmp_path: Path) -> None:

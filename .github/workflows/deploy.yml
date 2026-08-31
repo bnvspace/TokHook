@@ -91,7 +91,17 @@ jobs:
           previous_service_exists=false
           previous_target="$(readlink "$current_link" 2>/dev/null || true)"
           mkdir -p "$releases_dir"
+          find "$releases_dir" -mindepth 1 -maxdepth 1 -type d \
+            -name '.*.staging.*' -mmin +60 -exec rm -rf -- {} +
           rm -rf -- "$stage_dir"
+          cleanup_stage_on_exit() {
+            status=$?
+            if [ "$status" -ne 0 ]; then
+              rm -rf -- "$stage_dir"
+            fi
+            return "$status"
+          }
+          trap cleanup_stage_on_exit EXIT
           mkdir -p "$stage_dir"
           tar -xzf "/tmp/$ARCHIVE" -C "$stage_dir"
           test -f "$stage_dir/requirements.lock"
@@ -130,22 +140,10 @@ jobs:
             cp -a "$service_unit" "$previous_service_unit"
             previous_service_exists=true
           fi
-          install -o root -g root -m 644 \
-            "$stage_dir/deploy/ttd-bot.service" \
-            "$service_unit"
-          systemctl daemon-reload
-
-          if [ "$previous_target" = "$release_dir" ] && [ -f "$release_dir/ttd_bot/main.py" ]; then
-            rm -rf -- "$stage_dir"
-          else
-            rm -rf -- "$release_dir"
-            mv -T "$stage_dir" "$release_dir"
-          fi
-
-          ln -sfn "$release_dir" "$APP_DIR/.current.next"
-          mv -Tf "$APP_DIR/.current.next" "$current_link"
 
           rollback() {
+            trap - EXIT
+            rm -f -- "$APP_DIR/.current.next"
             if [ -n "$previous_target" ] && [ -d "$previous_target" ]; then
               ln -sfn "$previous_target" "$APP_DIR/.current.rollback"
               mv -Tf "$APP_DIR/.current.rollback" "$current_link"
@@ -169,6 +167,30 @@ jobs:
             exit 1
           }
 
+          rollback_on_exit() {
+            status=$?
+            if [ "$status" -ne 0 ]; then
+              rollback
+            fi
+            return "$status"
+          }
+          trap rollback_on_exit EXIT
+
+          install -o root -g root -m 644 \
+            "$stage_dir/deploy/ttd-bot.service" \
+            "$service_unit"
+          systemctl daemon-reload
+
+          if [ "$previous_target" = "$release_dir" ] && [ -f "$release_dir/ttd_bot/main.py" ]; then
+            rm -rf -- "$stage_dir"
+          else
+            rm -rf -- "$release_dir"
+            mv -T "$stage_dir" "$release_dir"
+          fi
+
+          ln -sfn "$release_dir" "$APP_DIR/.current.next"
+          mv -Tf "$APP_DIR/.current.next" "$current_link"
+
           if ! systemctl restart "$SERVICE_NAME"; then
             rollback
           fi
@@ -191,6 +213,7 @@ jobs:
 
           printf '%s\n' "$RELEASE_SHA" > "$APP_DIR/deployed_sha"
           chmod 644 "$APP_DIR/deployed_sha"
+          trap - EXIT
           rm -f -- "$previous_service_unit"
           find "$releases_dir" -mindepth 1 -maxdepth 1 -type d \
             -name '[0-9a-f]*' -printf '%T@ %p\n' \

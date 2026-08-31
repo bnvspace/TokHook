@@ -1,6 +1,9 @@
 import asyncio
+from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
+
+from aiogram.types import Chat, Message, User
 
 from ttd_bot import main
 from ttd_bot.config import Settings
@@ -41,16 +44,6 @@ def test_subscription_callback_checks_and_responds_on_every_press(monkeypatch) -
 
 
 def test_subscription_callback_updates_button_once_but_confirms_every_press(monkeypatch) -> None:
-    class FakeMessage:
-        def __init__(self) -> None:
-            self.reply_markup = main._subscription_keyboard(False)
-            self.answer = AsyncMock()
-            self.edit_reply_markup = AsyncMock(side_effect=self._apply_markup)
-
-        async def _apply_markup(self, *, reply_markup) -> None:
-            self.reply_markup = reply_markup
-
-    monkeypatch.setattr(main, "Message", FakeMessage)
     monkeypatch.setattr(
         main,
         "SETTINGS",
@@ -62,13 +55,28 @@ def test_subscription_callback_updates_button_once_but_confirms_every_press(monk
         ),
     )
     callback = _callback("member")
-    callback.message = FakeMessage()
+    message = Message(
+        message_id=1,
+        date=datetime.now(timezone.utc),
+        chat=Chat(id=1, type="private"),
+        from_user=User(id=42, is_bot=False, first_name="Test"),
+        reply_markup=main._subscription_keyboard(False),
+    )
+    callback.message = message
 
-    asyncio.run(main.subscription_callback_handler(callback))
-    asyncio.run(main.subscription_callback_handler(callback))
+    async def apply_markup(*, reply_markup) -> None:
+        object.__setattr__(message, "reply_markup", reply_markup)
 
-    assert callback.message.edit_reply_markup.await_count == 1
-    assert callback.message.answer.await_count == 2
+    with (
+        patch.object(Message, "answer", new_callable=AsyncMock) as answer_mock,
+        patch.object(Message, "edit_reply_markup", new_callable=AsyncMock) as edit_mock,
+    ):
+        edit_mock.side_effect = apply_markup
+        asyncio.run(main.subscription_callback_handler(callback))
+        asyncio.run(main.subscription_callback_handler(callback))
+
+    assert edit_mock.await_count == 1
+    assert answer_mock.await_count == 2
 
 
 def test_subscription_callback_answers_negative_on_every_press(monkeypatch) -> None:
