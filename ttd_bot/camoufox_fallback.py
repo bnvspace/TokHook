@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -12,14 +13,19 @@ from ttd_bot.downloader import (
     BROWSER_USER_AGENT,
     DownloadedMedia,
     IMAGE_EXTENSIONS,
+    MAX_DOWNLOAD_SECONDS,
+    MAX_IMAGE_BYTES,
+    MAX_MEDIA_BYTES,
+    MAX_PHOTO_IMAGES,
     UNIVERSAL_DATA_RE,
     VIDEO_EXTENSIONS,
+    _remaining_timeout,
 )
 
 
 LOGGER = logging.getLogger(__name__)
-MAX_MEDIA_BYTES = 128 * 1024 * 1024
 _CAMOUFOX_LOCK = Lock()
+MAX_VIDEO_CANDIDATES = 8
 
 
 class CamoufoxUnavailable(RuntimeError):
@@ -36,6 +42,7 @@ def download_tiktok_media_with_camoufox(
     page_url: str,
     download_dir: Path,
     profile_dir: Path,
+    deadline: float | None = None,
 ) -> DownloadedMedia:
     """Open a TikTok page in Camoufox and download URLs exposed by its JS state."""
 
@@ -47,11 +54,16 @@ def download_tiktok_media_with_camoufox(
         ) from exc
 
     with _CAMOUFOX_LOCK:
+        if deadline is None:
+            deadline = time.monotonic() + MAX_DOWNLOAD_SECONDS
+        if deadline <= time.monotonic():
+            return DownloadedMedia(videos=[], images=[])
         return _download_with_camoufox(
             Camoufox,
             page_url=page_url,
             download_dir=download_dir,
             profile_dir=profile_dir,
+            deadline=deadline,
         )
 
 
@@ -61,6 +73,7 @@ def _download_with_camoufox(
     page_url: str,
     download_dir: Path,
     profile_dir: Path,
+    deadline: float,
 ) -> DownloadedMedia:
     profile_dir.mkdir(parents=True, exist_ok=True)
     download_dir.mkdir(parents=True, exist_ok=True)
@@ -76,13 +89,17 @@ def _download_with_camoufox(
         page.set_default_navigation_timeout(60_000)
 
         try:
-            page.goto(page_url, wait_until="domcontentloaded", timeout=60_000)
+            page.goto(
+                page_url,
+                wait_until="domcontentloaded",
+                timeout=max(100, int(_remaining_timeout(deadline, 60) * 1000)),
+            )
         except Exception:
             # TikTok may keep a challenge request open after the useful page state
             # has already arrived. The DOM is still worth inspecting below.
             LOGGER.warning("Camoufox navigation did not finish for %s", page_url)
 
-        page.wait_for_timeout(3_500)
+        page.wait_for_timeout(int(min(3_500, _remaining_timeout(deadline, 3.5) * 1000)))
         webpage = page.content()
         candidates = _extract_media_urls(webpage)
 
@@ -95,11 +112,14 @@ def _download_with_camoufox(
                         candidates.videos.append(value)
 
         candidates = _deduplicate_media_urls(candidates)
+        candidates.videos = candidates.videos[:MAX_VIDEO_CANDIDATES]
+        candidates.images = candidates.images[:MAX_PHOTO_IMAGES]
         return _download_media_urls(
             context,
             candidates,
             download_dir=download_dir,
             referer=page_url,
+            deadline=deadline,
         )
 
 
@@ -171,6 +191,7 @@ def _download_media_urls(
     *,
     download_dir: Path,
     referer: str,
+    deadline: float,
 ) -> DownloadedMedia:
     videos: list[Path] = []
     images: list[Path] = []
@@ -182,24 +203,30 @@ def _download_media_urls(
     }
 
     for index, url in enumerate(candidates.videos, start=1):
+        if _remaining_timeout(deadline, 60) <= 0:
+            break
         media_path = _download_one_media(
             request_context,
             url,
             download_dir / f"video_{index:02d}",
             headers=headers,
             allowed_extensions=VIDEO_EXTENSIONS,
+            timeout=_remaining_timeout(deadline, 60),
         )
         if media_path:
             videos.append(media_path)
             break
 
     for index, url in enumerate(candidates.images, start=1):
+        if _remaining_timeout(deadline, 60) <= 0:
+            break
         media_path = _download_one_media(
             request_context,
             url,
             download_dir / f"image_{index:02d}",
             headers=headers,
             allowed_extensions=IMAGE_EXTENSIONS,
+            timeout=_remaining_timeout(deadline, 60),
         )
         if media_path:
             images.append(media_path)
@@ -214,19 +241,29 @@ def _download_one_media(
     *,
     headers: dict[str, str],
     allowed_extensions: set[str],
+    timeout: float,
 ) -> Path | None:
     try:
         response = request_context.get(
             url,
             headers=headers,
-            timeout=60_000,
+            timeout=int(timeout * 1000),
             fail_on_status_code=False,
         )
         if not response.ok:
             return None
 
+        max_bytes = MAX_IMAGE_BYTES if allowed_extensions == IMAGE_EXTENSIONS else MAX_MEDIA_BYTES
+        content_length = response.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > max_bytes:
+                    return None
+            except ValueError:
+                pass
+
         content = response.body()
-        if not content or len(content) > MAX_MEDIA_BYTES:
+        if not content or len(content) > max_bytes:
             return None
 
         extension = _guess_media_extension(

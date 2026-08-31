@@ -4,6 +4,7 @@ import json
 import logging
 import mimetypes
 import re
+import time
 from dataclasses import dataclass
 from http.cookiejar import MozillaCookieJar
 from pathlib import Path
@@ -43,6 +44,18 @@ BROWSER_USER_AGENT = (
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 MEDIA_EXTENSIONS = VIDEO_EXTENSIONS | IMAGE_EXTENSIONS
+ALLOWED_TIKTOK_HOSTS = {
+    "tiktok.com",
+    "www.tiktok.com",
+    "vm.tiktok.com",
+    "vt.tiktok.com",
+    "m.tiktok.com",
+}
+MAX_MEDIA_BYTES = 128 * 1024 * 1024
+MAX_IMAGE_BYTES = 32 * 1024 * 1024
+MAX_PAGE_BYTES = 16 * 1024 * 1024
+MAX_PHOTO_IMAGES = 35
+MAX_DOWNLOAD_SECONDS = 180
 
 
 class TikTokDownloadError(RuntimeError):
@@ -65,8 +78,7 @@ def extract_tiktok_url(text: str) -> str | None:
         return None
 
     url = match.group(0).rstrip(".,!?)]}>\"'")
-    parsed = urlparse(url)
-    if not parsed.netloc.lower().endswith("tiktok.com"):
+    if not _is_allowed_tiktok_url(url):
         return None
     return url
 
@@ -77,11 +89,21 @@ def download_tiktok_media(
     cookies_path: Path | None = None,
     camoufox_profile_path: Path | None = None,
 ) -> DownloadedMedia:
+    if not _is_allowed_tiktok_url(url):
+        raise TikTokDownloadError("Похоже, ссылка не ведет на TikTok-пост.")
+
+    download_dir.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + MAX_DOWNLOAD_SECONDS
     resolved_url = resolve_tiktok_url(url, cookies_path)
     normalized_url = normalize_tiktok_download_url(resolved_url)
 
     if is_tiktok_photo_url(resolved_url):
-        images = _download_photo_post_images(normalized_url, download_dir, cookies_path)
+        images = _download_photo_post_images(
+            normalized_url,
+            download_dir,
+            cookies_path,
+            deadline=deadline,
+        )
         if images:
             return DownloadedMedia(videos=[], images=images)
 
@@ -92,8 +114,10 @@ def download_tiktok_media(
         "no_warnings": True,
         "restrictfilenames": True,
         "windowsfilenames": True,
-        "retries": 3,
-        "fragment_retries": 3,
+        "retries": 2,
+        "fragment_retries": 2,
+        "socket_timeout": 30,
+        "max_filesize": MAX_MEDIA_BYTES,
         "skip_unavailable_fragments": False,
         "format": "best[ext=mp4]/best",
         "merge_output_format": "mp4",
@@ -112,10 +136,15 @@ def download_tiktok_media(
 
     media_files = _collect_downloaded_media(download_dir)
     if not media_files:
-        media_files = _collect_media_from_info(info)
+        media_files = _collect_media_from_info(info, download_dir)
 
     if not media_files:
-        media_files = _download_photo_post_images(normalized_url, download_dir, cookies_path)
+        media_files = _download_photo_post_images(
+            normalized_url,
+            download_dir,
+            cookies_path,
+            deadline=deadline,
+        )
 
     videos = [path for path in media_files if path.suffix.lower() in VIDEO_EXTENSIONS]
     images = [path for path in media_files if path.suffix.lower() in IMAGE_EXTENSIONS]
@@ -137,6 +166,7 @@ def download_tiktok_media(
             normalized_url,
             download_dir,
             camoufox_profile_path,
+            deadline=deadline,
         )
     except CamoufoxUnavailable:
         browser_result = DownloadedMedia(videos=[], images=[])
@@ -179,22 +209,34 @@ def resolve_tiktok_url(url: str, cookies_path: Path | None = None) -> str:
 
     try:
         with _open_url(url, cookies_path=cookies_path) as response:
-            return response.geturl()
+            resolved_url = response.geturl()
+            if not _is_allowed_tiktok_url(resolved_url):
+                raise TikTokDownloadError(
+                    "Ссылка перенаправляет не на TikTok-пост."
+                )
+            return resolved_url
     except (HTTPError, URLError, OSError):
         return url
 
 
 def _collect_downloaded_media(download_dir: Path) -> list[Path]:
+    resolved_download_dir = download_dir.resolve()
     files = [
         path
         for path in download_dir.rglob("*")
-        if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS
+        if (
+            path.is_file()
+            and path.suffix.lower() in MEDIA_EXTENSIONS
+            and _is_path_inside(path, resolved_download_dir)
+            and _media_file_is_within_limit(path)
+        )
     ]
     return sorted(files, key=lambda path: (path.stat().st_mtime, path.name))
 
 
-def _collect_media_from_info(info: object) -> list[Path]:
+def _collect_media_from_info(info: object, download_dir: Path) -> list[Path]:
     candidates: list[Path] = []
+    resolved_download_dir = download_dir.resolve()
 
     def visit(node: object) -> None:
         if not isinstance(node, dict):
@@ -204,7 +246,12 @@ def _collect_media_from_info(info: object) -> list[Path]:
             value = node.get(key)
             if isinstance(value, str):
                 path = Path(value)
-                if path.exists() and path.suffix.lower() in MEDIA_EXTENSIONS:
+                if (
+                    path.exists()
+                    and path.suffix.lower() in MEDIA_EXTENSIONS
+                    and _is_path_inside(path, resolved_download_dir)
+                    and _media_file_is_within_limit(path)
+                ):
                     candidates.append(path)
 
         requested_downloads = node.get("requested_downloads")
@@ -214,7 +261,12 @@ def _collect_media_from_info(info: object) -> list[Path]:
                     value = item.get("filepath")
                     if isinstance(value, str):
                         path = Path(value)
-                        if path.exists() and path.suffix.lower() in MEDIA_EXTENSIONS:
+                        if (
+                            path.exists()
+                            and path.suffix.lower() in MEDIA_EXTENSIONS
+                            and _is_path_inside(path, resolved_download_dir)
+                            and _media_file_is_within_limit(path)
+                        ):
                             candidates.append(path)
 
         entries = node.get("entries")
@@ -235,9 +287,24 @@ def _collect_media_from_info(info: object) -> list[Path]:
     return unique_paths
 
 
-def _download_photo_post_images(page_url: str, download_dir: Path, cookies_path: Path | None) -> list[Path]:
+def _download_photo_post_images(
+    page_url: str,
+    download_dir: Path,
+    cookies_path: Path | None,
+    *,
+    deadline: float | None = None,
+) -> list[Path]:
+    if deadline is None:
+        deadline = time.monotonic() + MAX_DOWNLOAD_SECONDS
+    if _remaining_timeout(deadline, 30) <= 0:
+        return []
+
     try:
-        webpage = _download_text(page_url, cookies_path=cookies_path)
+        webpage = _download_text(
+            page_url,
+            cookies_path=cookies_path,
+            timeout=_remaining_timeout(deadline, 30),
+        )
     except (HTTPError, URLError, OSError):
         return []
 
@@ -246,14 +313,24 @@ def _download_photo_post_images(page_url: str, download_dir: Path, cookies_path:
         return []
 
     downloaded_images: list[Path] = []
-    for index, image_url in enumerate(image_urls, start=1):
+    for index, image_url in enumerate(image_urls[:MAX_PHOTO_IMAGES], start=1):
+        timeout = _remaining_timeout(deadline, 30)
+        if timeout <= 0:
+            break
         try:
-            response = _open_url(image_url, cookies_path=cookies_path, referer=page_url)
+            response = _open_url(
+                image_url,
+                cookies_path=cookies_path,
+                referer=page_url,
+                timeout=timeout,
+            )
             with response:
+                content = _read_response_limited(response, MAX_IMAGE_BYTES)
+                if not content:
+                    continue
                 extension = _guess_image_extension(image_url, response.headers.get("Content-Type"))
                 target_path = download_dir / f"image_{index:02d}{extension}"
-                with target_path.open("wb") as file:
-                    file.write(response.read())
+                target_path.write_bytes(content)
         except (HTTPError, URLError, OSError):
             continue
         downloaded_images.append(target_path)
@@ -310,12 +387,32 @@ def _extract_photo_image_urls(webpage: str) -> list[str]:
     return unique_urls
 
 
-def _download_text(url: str, *, cookies_path: Path | None = None, referer: str | None = None) -> str:
-    with _open_url(url, cookies_path=cookies_path, referer=referer) as response:
-        return response.read().decode("utf-8", "replace")
+def _download_text(
+    url: str,
+    *,
+    cookies_path: Path | None = None,
+    referer: str | None = None,
+    timeout: float = 30,
+) -> str:
+    with _open_url(
+        url,
+        cookies_path=cookies_path,
+        referer=referer,
+        timeout=timeout,
+    ) as response:
+        content = _read_response_limited(response, MAX_PAGE_BYTES)
+        if content is None:
+            raise OSError("TikTok page exceeds the configured size limit.")
+        return content.decode("utf-8", "replace")
 
 
-def _open_url(url: str, *, cookies_path: Path | None = None, referer: str | None = None):
+def _open_url(
+    url: str,
+    *,
+    cookies_path: Path | None = None,
+    referer: str | None = None,
+    timeout: float = 30,
+):
     handlers = []
     if cookies_path:
         cookie_jar = MozillaCookieJar()
@@ -330,7 +427,54 @@ def _open_url(url: str, *, cookies_path: Path | None = None, referer: str | None
     if referer:
         headers["Referer"] = referer
     request = Request(url, headers=headers)
-    return opener.open(request, timeout=30)
+    return opener.open(request, timeout=timeout)
+
+
+def _read_response_limited(response: object, max_bytes: int) -> bytes | None:
+    content_length = response.headers.get("Content-Length")
+    if content_length:
+        try:
+            if int(content_length) > max_bytes:
+                return None
+        except ValueError:
+            pass
+
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = response.read(min(64 * 1024, max_bytes - total + 1))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > max_bytes:
+            return None
+    return b"".join(chunks)
+
+
+def _remaining_timeout(deadline: float, default: float) -> float:
+    return min(default, max(0.0, deadline - time.monotonic()))
+
+
+def _is_path_inside(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def _media_file_is_within_limit(path: Path) -> bool:
+    try:
+        max_bytes = MAX_IMAGE_BYTES if path.suffix.lower() in IMAGE_EXTENSIONS else MAX_MEDIA_BYTES
+        return path.stat().st_size <= max_bytes
+    except OSError:
+        return False
+
+
+def _is_allowed_tiktok_url(url: str) -> bool:
+    hostname = (urlparse(url).hostname or "").lower().rstrip(".")
+    return hostname in ALLOWED_TIKTOK_HOSTS
 
 
 def _guess_image_extension(url: str, content_type: str | None) -> str:

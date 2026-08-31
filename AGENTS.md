@@ -58,7 +58,7 @@ For changes affecting Telegram handlers, subscription checks, downloader behavio
 
 - Confirm the GitHub Actions run for the pushed `main` commit completed successfully.
 - Confirm the deployed commit SHA matches the pushed `git rev-parse HEAD`.
-- Confirm `/opt/ttd-bot/ttd_bot/main.py`, `/opt/ttd-bot/ttd_bot/downloader.py`, and `/opt/ttd-bot/requirements.txt` are present on the VPS.
+- Confirm `/opt/ttd-bot/current/ttd_bot/main.py`, `/opt/ttd-bot/current/ttd_bot/downloader.py`, and `/opt/ttd-bot/requirements.txt` are present on the VPS.
 - Confirm `ttd-bot.service` is `active` and `running`.
 - For behavior changes, run a bounded live smoke test and inspect service logs for errors and the actual user-visible result.
 

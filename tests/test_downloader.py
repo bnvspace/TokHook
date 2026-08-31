@@ -1,7 +1,14 @@
+from pathlib import Path
+
 import pytest
 
 from ttd_bot.downloader import (
+    MAX_IMAGE_BYTES,
+    TikTokDownloadError,
+    _collect_media_from_info,
+    _collect_downloaded_media,
     _extract_photo_image_urls,
+    _read_response_limited,
     extract_tiktok_url,
     is_tiktok_photo_url,
     normalize_tiktok_download_url,
@@ -40,6 +47,10 @@ def test_extract_tiktok_url_strips_trailing_punctuation() -> None:
 
 def test_extract_tiktok_url_returns_none_for_non_tiktok_text() -> None:
     assert extract_tiktok_url("https://example.com/video/42") is None
+
+
+def test_extract_tiktok_url_rejects_lookalike_host() -> None:
+    assert extract_tiktok_url("https://tiktok.com.evil.example/@name/video/42") is None
 
 
 def test_normalize_tiktok_download_url_converts_photo_post_to_video_post() -> None:
@@ -133,3 +144,53 @@ def test_resolve_tiktok_url_returns_redirect_target_for_short_link(monkeypatch: 
     assert resolve_tiktok_url("https://vt.tiktok.com/ZS9n2pqYV/") == (
         "https://www.tiktok.com/@gallerieapp/photo/7634004117156908318?_r=1&_t=ZS-96CU8sYh4f2"
     )
+
+
+def test_resolve_tiktok_url_rejects_external_redirect(monkeypatch: pytest.MonkeyPatch) -> None:
+    class DummyResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def geturl(self) -> str:
+            return "https://example.com/redirected"
+
+    monkeypatch.setattr(
+        "ttd_bot.downloader._open_url",
+        lambda url, cookies_path=None, referer=None: DummyResponse(),
+    )
+
+    with pytest.raises(TikTokDownloadError, match="перенаправляет"):
+        resolve_tiktok_url("https://vt.tiktok.com/ZS9n2pqYV/")
+
+
+def test_read_response_limited_stops_after_limit() -> None:
+    class DummyResponse:
+        headers: dict[str, str] = {}
+
+        def read(self, size: int) -> bytes:
+            return b"x" * (size + 1)
+
+    assert _read_response_limited(DummyResponse(), 16) is None
+
+
+def test_collect_media_ignores_oversize_files_and_external_paths(tmp_path: Path) -> None:
+    inside = tmp_path / "ok.jpg"
+    inside.write_bytes(b"jpg")
+    oversized = tmp_path / "oversized.jpg"
+    oversized.touch()
+    with oversized.open("r+b") as file:
+        file.truncate(MAX_IMAGE_BYTES + 1)
+    outside = tmp_path.parent / "outside.mp4"
+    outside.write_bytes(b"video")
+
+    try:
+        assert _collect_downloaded_media(tmp_path) == [inside]
+        assert _collect_media_from_info(
+            {"_filename": str(outside), "entries": [{"filepath": str(inside)}]},
+            tmp_path,
+        ) == [inside]
+    finally:
+        outside.unlink(missing_ok=True)

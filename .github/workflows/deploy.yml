@@ -19,15 +19,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: python -m pip install --disable-pip-version-check -r requirements.txt
+        run: python -m pip install --disable-pip-version-check -r requirements.lock
 
       - name: Run tests
         run: python -m pytest -q
@@ -47,7 +47,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Configure SSH
         shell: bash
@@ -64,7 +64,7 @@ jobs:
 
       - name: Package source
         shell: bash
-        run: tar -czf "/tmp/ttd-bot-${GITHUB_SHA}.tar.gz" ttd_bot requirements.txt
+        run: tar -czf "/tmp/ttd-bot-${GITHUB_SHA}.tar.gz" ttd_bot requirements.txt requirements.lock deploy/ttd-bot.service
 
       - name: Upload source
         shell: bash
@@ -82,33 +82,98 @@ jobs:
             "ARCHIVE='$archive' RELEASE_SHA='$GITHUB_SHA' APP_DIR='$APP_DIR' SERVICE_NAME='$SERVICE_NAME' bash -s" <<'REMOTE'
           set -euo pipefail
 
-          release_dir="$APP_DIR/.deploy/$RELEASE_SHA"
-          mkdir -p "$APP_DIR/.deploy"
-          rm -rf -- "$release_dir"
-          mkdir -p "$release_dir"
-          tar -xzf "/tmp/$ARCHIVE" -C "$release_dir"
-          test -f "$release_dir/requirements.txt"
-          test -f "$release_dir/ttd_bot/main.py"
+          release_dir="$APP_DIR/releases/$RELEASE_SHA"
+          releases_dir="$APP_DIR/releases"
+          current_link="$APP_DIR/current"
+          stage_dir="$releases_dir/.${RELEASE_SHA}.staging.$$"
+          previous_target="$(readlink "$current_link" 2>/dev/null || true)"
+          mkdir -p "$releases_dir"
+          rm -rf -- "$stage_dir"
+          mkdir -p "$stage_dir"
+          tar -xzf "/tmp/$ARCHIVE" -C "$stage_dir"
+          test -f "$stage_dir/requirements.lock"
+          test -f "$stage_dir/ttd_bot/main.py"
+          test -f "$stage_dir/deploy/ttd-bot.service"
 
           "$APP_DIR/.venv/bin/python3" -m pip install \
             --disable-pip-version-check \
-            -r "$release_dir/requirements.txt"
-          "$APP_DIR/.venv/bin/python3" -m camoufox fetch
+            -r "$stage_dir/requirements.lock"
 
-          mkdir -p "$APP_DIR/ttd_bot"
-          cp -a "$release_dir/ttd_bot/." "$APP_DIR/ttd_bot/"
-          cp "$release_dir/requirements.txt" "$APP_DIR/requirements.txt"
+          if ! getent group ttd-bot >/dev/null; then
+            groupadd --system ttd-bot
+          fi
+          if ! getent passwd ttd-bot >/dev/null; then
+            useradd --system --gid ttd-bot --home-dir "$APP_DIR" --shell /usr/sbin/nologin ttd-bot
+          fi
+          usermod --append --groups ttd-bot ttd-bot
+          install -d -o ttd-bot -g ttd-bot -m 750 \
+            "$APP_DIR/tmp" "$APP_DIR/.cache"
+          install -d -o root -g ttd-bot -m 750 "$releases_dir"
+          test -r "$APP_DIR/.env"
+          chown ttd-bot:ttd-bot "$APP_DIR/.env"
+          chmod 600 "$APP_DIR/.env"
+          chown -R root:ttd-bot "$stage_dir"
+          find "$stage_dir" -type d -exec chmod 750 {} +
+          find "$stage_dir" -type f -exec chmod 640 {} +
+          chown ttd-bot:ttd-bot "$APP_DIR/tmp" "$APP_DIR/.cache"
+          cp "$stage_dir/requirements.txt" "$APP_DIR/requirements.txt"
+          cp "$stage_dir/requirements.lock" "$APP_DIR/requirements.lock"
+          runuser -u ttd-bot -- env \
+            HOME="$APP_DIR" \
+            XDG_CACHE_HOME="$APP_DIR/.cache" \
+            "$APP_DIR/.venv/bin/python3" -m camoufox fetch
 
-          systemctl restart "$SERVICE_NAME"
-          for attempt in 1 2 3 4 5; do
+          install -o root -g root -m 644 \
+            "$stage_dir/deploy/ttd-bot.service" \
+            /etc/systemd/system/ttd-bot.service
+          systemctl daemon-reload
+
+          if [ "$previous_target" = "$release_dir" ] && [ -f "$release_dir/ttd_bot/main.py" ]; then
+            rm -rf -- "$stage_dir"
+          else
+            rm -rf -- "$release_dir"
+            mv -T "$stage_dir" "$release_dir"
+          fi
+
+          ln -sfn "$release_dir" "$APP_DIR/.current.next"
+          mv -Tf "$APP_DIR/.current.next" "$current_link"
+
+          rollback() {
+            if [ -n "$previous_target" ] && [ -d "$previous_target" ]; then
+              ln -sfn "$previous_target" "$APP_DIR/.current.rollback"
+              mv -Tf "$APP_DIR/.current.rollback" "$current_link"
+              systemctl restart "$SERVICE_NAME" || true
+            else
+              rm -f -- "$current_link"
+              systemctl stop "$SERVICE_NAME" || true
+            fi
+            exit 1
+          }
+
+          if ! systemctl restart "$SERVICE_NAME"; then
+            rollback
+          fi
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
             if systemctl is-active --quiet "$SERVICE_NAME"; then
               break
             fi
             sleep 2
           done
-          systemctl is-active --quiet "$SERVICE_NAME"
+          systemctl is-active --quiet "$SERVICE_NAME" || rollback
+          test "$(systemctl show "$SERVICE_NAME" -p User --value)" = "ttd-bot" || rollback
+          test "$(systemctl show "$SERVICE_NAME" -p WorkingDirectory --value)" = "$current_link" || rollback
+
+          if ! runuser -u ttd-bot -- env \
+            HOME="$APP_DIR" \
+            XDG_CACHE_HOME="$APP_DIR/.cache" \
+            "$APP_DIR/.venv/bin/python3" -c 'import json, urllib.request; from dotenv import dotenv_values; token = dotenv_values("/opt/ttd-bot/.env").get("TELEGRAM_BOT_TOKEN"); assert token; data = json.load(urllib.request.urlopen("https://api.telegram.org/bot" + token + "/getMe", timeout=20)); assert data.get("ok") is True; print("telegram_getme=ok")'; then
+            rollback
+          fi
+
+          printf '%s\n' "$RELEASE_SHA" > "$APP_DIR/deployed_sha"
+          chmod 644 "$APP_DIR/deployed_sha"
           systemctl show "$SERVICE_NAME" \
             -p ActiveState -p SubState -p MainPID --no-pager
 
-          rm -rf -- "$release_dir" "/tmp/$ARCHIVE"
+          rm -f -- "/tmp/$ARCHIVE"
           REMOTE

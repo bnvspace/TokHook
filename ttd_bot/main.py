@@ -26,6 +26,10 @@ from ttd_bot.downloader import DownloadedMedia, TikTokDownloadError, download_ti
 router = Router()
 SETTINGS: Settings | None = None
 TEMP_ROOT = Path(__file__).resolve().parents[1] / "tmp"
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(2)
+ACTIVE_USERS: set[int] = set()
+ACTIVE_USERS_LOCK = asyncio.Lock()
+DOWNLOAD_SLOT_WAIT_SECONDS = 0.2
 
 HELP_TEXT = (
     "Просто отправь ссылку на TikTok-пост. "
@@ -67,10 +71,6 @@ async def subscription_callback_handler(callback: CallbackQuery) -> None:
 
     if is_subscribed:
         await callback.answer("Подписка подтверждена ✅")
-        await callback.bot.send_message(
-            chat_id=callback.from_user.id,
-            text=SUBSCRIPTION_CONFIRMED_TEXT,
-        )
     else:
         await callback.answer(
             "Подпишись на канал и нажми кнопку ещё раз.",
@@ -80,7 +80,22 @@ async def subscription_callback_handler(callback: CallbackQuery) -> None:
     if isinstance(callback.message, Message):
         new_markup = _subscription_keyboard(is_subscribed)
         if _subscription_button_state(callback.message) is not is_subscribed:
-            await callback.message.edit_reply_markup(reply_markup=new_markup)
+            try:
+                await callback.message.edit_reply_markup(reply_markup=new_markup)
+            except TelegramAPIError:
+                logging.exception("Could not update subscription button")
+
+    if is_subscribed:
+        try:
+            if isinstance(callback.message, Message):
+                await callback.message.answer(SUBSCRIPTION_CONFIRMED_TEXT)
+            else:
+                await callback.bot.send_message(
+                    chat_id=callback.from_user.id,
+                    text=SUBSCRIPTION_CONFIRMED_TEXT,
+                )
+        except TelegramAPIError:
+            logging.exception("Could not send subscription confirmation")
 
 
 @router.message(Command("help"))
@@ -95,52 +110,87 @@ async def link_handler(message: Message) -> None:
         await message.answer("Пришли ссылку на TikTok-пост сообщением.")
         return
 
-    try:
-        is_subscribed = await _is_subscribed(message.bot, message.from_user.id)
-    except SubscriptionCheckError:
-        logging.exception("Could not check subscription for user %s", message.from_user.id)
-        await message.answer(
-            "Не удалось проверить подписку. Убедись, что бот добавлен администратором канала.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=_subscription_keyboard(),
-        )
+    if message.from_user is None:
+        return
+    user_id = message.from_user.id
+    async with ACTIVE_USERS_LOCK:
+        already_active = user_id in ACTIVE_USERS
+        if not already_active:
+            ACTIVE_USERS.add(user_id)
+    if already_active:
+        await message.answer("Предыдущая ссылка ещё обрабатывается. Подожди немного.")
         return
 
-    if not is_subscribed:
-        await message.answer(
-            _subscription_prompt(),
-            parse_mode=ParseMode.HTML,
-            reply_markup=_subscription_keyboard(False),
-        )
-        return
-
-    await message.answer(SUBSCRIPTION_CONFIRMED_TEXT)
-    progress_message = await message.answer("Скачиваю медиа...")
+    progress_message: Message | None = None
 
     try:
-        TEMP_ROOT.mkdir(parents=True, exist_ok=True)
-        with TemporaryDirectory(prefix="ttd_", dir=TEMP_ROOT) as temp_dir:
-            download_dir = Path(temp_dir)
-            async with ChatActionSender.upload_document(chat_id=message.chat.id, bot=message.bot):
-                media = await asyncio.to_thread(
-                    download_tiktok_media,
-                    url,
-                    download_dir,
-                    _get_settings().tiktok_cookies_path,
-                    _get_settings().camoufox_profile_path,
-                )
+        try:
+            is_subscribed = await _is_subscribed(message.bot, message.from_user.id)
+        except SubscriptionCheckError:
+            logging.exception("Could not check subscription for user %s", message.from_user.id)
+            await message.answer(
+                "Не удалось проверить подписку. Убедись, что бот добавлен администратором канала.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=_subscription_keyboard(),
+            )
+            return
 
-            await progress_message.edit_text("Отправляю медиа...")
-            await _send_media(message, media)
+        if not is_subscribed:
+            await message.answer(
+                _subscription_prompt(),
+                parse_mode=ParseMode.HTML,
+                reply_markup=_subscription_keyboard(False),
+            )
+            return
+
+        await message.answer(SUBSCRIPTION_CONFIRMED_TEXT)
+        progress_message = await message.answer("Скачиваю медиа...")
+        try:
+            await asyncio.wait_for(
+                DOWNLOAD_SEMAPHORE.acquire(),
+                timeout=DOWNLOAD_SLOT_WAIT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            await progress_message.edit_text(
+                "Сейчас бот занят другими загрузками. Попробуй ещё раз через несколько секунд."
+            )
+            return
+
+        try:
+            TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+            with TemporaryDirectory(prefix="ttd_", dir=TEMP_ROOT) as temp_dir:
+                download_dir = Path(temp_dir)
+                async with ChatActionSender.upload_document(chat_id=message.chat.id, bot=message.bot):
+                    media = await asyncio.to_thread(
+                        download_tiktok_media,
+                        url,
+                        download_dir,
+                        _get_settings().tiktok_cookies_path,
+                        _get_settings().camoufox_profile_path,
+                    )
+
+                await progress_message.edit_text("Отправляю медиа...")
+                await _send_media(message, media)
+        finally:
+            DOWNLOAD_SEMAPHORE.release()
     except TikTokDownloadError as exc:
-        await progress_message.edit_text(str(exc))
+        if progress_message is not None:
+            await progress_message.edit_text(str(exc))
+        else:
+            await message.answer(str(exc))
         return
     except Exception:
         logging.exception("Unhandled error while processing TikTok URL: %s", url)
-        await progress_message.edit_text("Что-то пошло не так при обработке ссылки.")
+        if progress_message is not None:
+            await progress_message.edit_text("Что-то пошло не так при обработке ссылки.")
+        else:
+            await message.answer("Что-то пошло не так при обработке ссылки.")
         return
+    finally:
+        ACTIVE_USERS.discard(user_id)
 
-    await progress_message.delete()
+    if progress_message is not None:
+        await progress_message.delete()
 
 
 async def _send_media(message: Message, media: DownloadedMedia) -> None:

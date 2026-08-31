@@ -1,0 +1,28 @@
+[Unit]
+Description=TTD TikTok Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ttd-bot
+Group=ttd-bot
+WorkingDirectory=/opt/ttd-bot/current
+EnvironmentFile=/opt/ttd-bot/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/opt/ttd-bot
+Environment=XDG_CACHE_HOME=/opt/ttd-bot/.cache
+Environment=CAMOUFOX_PROFILE_PATH=/opt/ttd-bot/tmp/camoufox-profile
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/ttd-bot/tmp /opt/ttd-bot/.cache
+ExecStart=/opt/ttd-bot/.venv/bin/python3 -m ttd_bot.main
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
