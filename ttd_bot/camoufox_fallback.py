@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes
+import os
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Lock, Timer
+from threading import Lock
 from urllib.parse import urlparse
 
 from ttd_bot.downloader import (
@@ -19,9 +22,12 @@ from ttd_bot.downloader import (
     MAX_PHOTO_IMAGES,
     UNIVERSAL_DATA_RE,
     VIDEO_EXTENSIONS,
+    _collect_downloaded_media,
     _open_url,
     _remaining_timeout,
+    _reap_process,
     _set_response_timeout,
+    _terminate_process_tree,
 )
 
 
@@ -32,15 +38,6 @@ MAX_VIDEO_CANDIDATES = 8
 
 class CamoufoxUnavailable(RuntimeError):
     """Raised when the optional browser fallback is not installed."""
-
-
-def _abort_camoufox_page(page: object) -> None:
-    """Best-effort watchdog abort for sync Playwright calls without a timeout arg."""
-
-    try:
-        page.close()
-    except Exception:
-        LOGGER.warning("Camoufox watchdog could not close the page")
 
 
 @dataclass(slots=True)
@@ -70,15 +67,80 @@ def download_tiktok_media_with_camoufox(
     if remaining <= 0 or not _CAMOUFOX_LOCK.acquire(timeout=remaining):
         return DownloadedMedia(videos=[], images=[])
     try:
-        return _download_with_camoufox(
-            Camoufox,
+        return _run_camoufox_process(
             page_url=page_url,
             download_dir=download_dir,
             profile_dir=profile_dir,
-            deadline=deadline,
+            timeout=remaining,
         )
     finally:
         _CAMOUFOX_LOCK.release()
+
+
+def _run_camoufox_process(
+    *,
+    page_url: str,
+    download_dir: Path,
+    profile_dir: Path,
+    timeout: float,
+) -> DownloadedMedia:
+    command = [
+        sys.executable,
+        "-m",
+        "ttd_bot.camoufox_fallback",
+        "--worker",
+        page_url,
+        str(download_dir),
+        str(profile_dir),
+        str(max(0.01, timeout)),
+    ]
+    popen_kwargs: dict[str, object] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "cwd": str(Path(__file__).resolve().parents[1]),
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    try:
+        process = subprocess.Popen(command, **popen_kwargs)
+    except OSError:
+        LOGGER.exception("Could not start Camoufox worker")
+        return DownloadedMedia(videos=[], images=[])
+    if os.name != "nt":
+        try:
+            process._ttd_process_group = os.getpgid(process.pid)
+        except OSError:
+            pass
+
+    try:
+        process.communicate(timeout=max(0.01, timeout))
+    except subprocess.TimeoutExpired:
+        _terminate_process_tree(process)
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            _terminate_process_tree(process)
+            try:
+                process.kill()
+            except OSError:
+                pass
+            _reap_process(process)
+        LOGGER.warning("Camoufox worker exceeded its download deadline")
+        return DownloadedMedia(videos=[], images=[])
+
+    if process.returncode != 0:
+        LOGGER.warning("Camoufox worker failed with exit code %s", process.returncode)
+        return DownloadedMedia(videos=[], images=[])
+
+    media_files = _collect_downloaded_media(download_dir)
+    return DownloadedMedia(
+        videos=[path for path in media_files if path.suffix.lower() in VIDEO_EXTENSIONS],
+        images=[path for path in media_files if path.suffix.lower() in IMAGE_EXTENSIONS],
+    )
 
 
 def _download_with_camoufox(
@@ -99,70 +161,60 @@ def _download_with_camoufox(
         user_data_dir=str(profile_dir),
     ) as context:
         page = context.pages[0] if context.pages else context.new_page()
-        watchdog = Timer(
-            max(0.0, deadline - time.monotonic()),
-            _abort_camoufox_page,
-            args=(page,),
-        )
-        watchdog.daemon = True
-        watchdog.start()
+        page.set_default_timeout(15_000)
+        page.set_default_navigation_timeout(60_000)
+
         try:
-            page.set_default_timeout(15_000)
-            page.set_default_navigation_timeout(60_000)
-
-            try:
-                navigation_timeout = _remaining_timeout(deadline, 60)
-                if navigation_timeout <= 0:
-                    return DownloadedMedia(videos=[], images=[])
-                page.goto(
-                    page_url,
-                    wait_until="domcontentloaded",
-                    timeout=max(1, int(navigation_timeout * 1000)),
-                )
-            except Exception:
-                # TikTok may keep a challenge request open after the useful page state
-                # has already arrived. The DOM is still worth inspecting below.
-                LOGGER.warning("Camoufox navigation did not finish for %s", page_url)
-
-            remaining = _remaining_timeout(deadline, 15)
-            if remaining <= 0:
+            navigation_timeout = _remaining_timeout(deadline, 60)
+            if navigation_timeout <= 0:
                 return DownloadedMedia(videos=[], images=[])
-            page.set_default_timeout(max(1, int(remaining * 1000)))
-            page.wait_for_timeout(int(min(3_500, remaining * 1000)))
+            page.goto(
+                page_url,
+                wait_until="domcontentloaded",
+                timeout=max(1, int(navigation_timeout * 1000)),
+            )
+        except Exception:
+            # TikTok may keep a challenge request open after the useful page state
+            # has already arrived. The DOM is still worth inspecting below.
+            LOGGER.warning("Camoufox navigation did not finish for %s", page_url)
+
+        remaining = _remaining_timeout(deadline, 15)
+        if remaining <= 0:
+            return DownloadedMedia(videos=[], images=[])
+        page.set_default_timeout(max(1, int(remaining * 1000)))
+        page.wait_for_timeout(int(min(3_500, remaining * 1000)))
+        if _remaining_timeout(deadline, 15) <= 0:
+            return DownloadedMedia(videos=[], images=[])
+        webpage = page.content()
+        if _remaining_timeout(deadline, 15) <= 0:
+            return DownloadedMedia(videos=[], images=[])
+        candidates = _extract_media_urls(webpage)
+
+        for locator in ("video", "source"):
             if _remaining_timeout(deadline, 15) <= 0:
-                return DownloadedMedia(videos=[], images=[])
-            webpage = page.content()
-            if _remaining_timeout(deadline, 15) <= 0:
-                return DownloadedMedia(videos=[], images=[])
-            candidates = _extract_media_urls(webpage)
-
-            for locator in ("video", "source"):
+                break
+            elements = page.locator(locator)
+            for index in range(elements.count()):
                 if _remaining_timeout(deadline, 15) <= 0:
                     break
-                elements = page.locator(locator)
-                for index in range(elements.count()):
+                element = elements.nth(index)
+                for attribute in ("src", "data-src"):
                     if _remaining_timeout(deadline, 15) <= 0:
                         break
-                    element = elements.nth(index)
-                    for attribute in ("src", "data-src"):
-                        if _remaining_timeout(deadline, 15) <= 0:
-                            break
-                        value = element.get_attribute(attribute)
-                        if value and value.startswith("http"):
-                            candidates.videos.append(value)
+                    value = element.get_attribute(attribute)
+                    if value and value.startswith("http"):
+                        candidates.videos.append(value)
 
-            candidates = _deduplicate_media_urls(candidates)
-            candidates.videos = candidates.videos[:MAX_VIDEO_CANDIDATES]
-            candidates.images = candidates.images[:MAX_PHOTO_IMAGES]
-            return _download_media_urls(
-                context,
-                candidates,
-                download_dir=download_dir,
-                referer=page_url,
-                deadline=deadline,
-            )
-        finally:
-            watchdog.cancel()
+        candidates = _deduplicate_media_urls(candidates)
+        candidates.videos = candidates.videos[:MAX_VIDEO_CANDIDATES]
+        candidates.images = candidates.images[:MAX_PHOTO_IMAGES]
+        return _download_media_urls(
+            context,
+            candidates,
+            download_dir=download_dir,
+            referer=page_url,
+            deadline=deadline,
+        )
 
 
 def _extract_media_urls(webpage: str) -> _MediaUrls:
@@ -412,3 +464,25 @@ def _guess_media_extension(
 def _safe_url(url: str) -> str:
     parsed = urlparse(url)
     return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+
+def _worker_main(arguments: list[str]) -> int:
+    if len(arguments) != 5:
+        return 2
+
+    from camoufox.sync_api import Camoufox
+
+    page_url, download_dir, profile_dir, timeout_text = arguments[1:]
+    deadline = time.monotonic() + max(0.01, float(timeout_text))
+    _download_with_camoufox(
+        Camoufox,
+        page_url=page_url,
+        download_dir=Path(download_dir),
+        profile_dir=Path(profile_dir),
+        deadline=deadline,
+    )
+    return 0
+
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--worker":
+    raise SystemExit(_worker_main(sys.argv[1:]))

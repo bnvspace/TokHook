@@ -674,6 +674,11 @@ def _run_yt_dlp(
 
     try:
         process = subprocess.Popen(command, **popen_kwargs)
+        if os.name != "nt":
+            try:
+                process._ttd_process_group = os.getpgid(process.pid)
+            except OSError:
+                pass
         try:
             stdout, stderr = process.communicate(timeout=max(0.01, timeout))
         except subprocess.TimeoutExpired:
@@ -705,10 +710,10 @@ def _run_yt_dlp(
 
 
 def _terminate_process_tree(process: subprocess.Popen) -> None:
-    if process.poll() is not None:
-        return
     try:
         if os.name == "nt":
+            if process.poll() is not None:
+                return
             subprocess.run(
                 ["taskkill", "/PID", str(process.pid), "/T", "/F"],
                 stdout=subprocess.DEVNULL,
@@ -717,7 +722,12 @@ def _terminate_process_tree(process: subprocess.Popen) -> None:
                 timeout=5,
             )
         else:
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            process_group = getattr(process, "_ttd_process_group", None)
+            if process_group is None:
+                if process.poll() is not None:
+                    return
+                process_group = os.getpgid(process.pid)
+            os.killpg(process_group, signal.SIGKILL)
     except (OSError, ProcessLookupError, subprocess.TimeoutExpired):
         try:
             process.kill()
