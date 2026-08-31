@@ -34,6 +34,9 @@ HELP_TEXT = (
 
 SUBSCRIPTION_CALLBACK = "check_subscription"
 SUBSCRIBED_STATUSES = {"member", "administrator", "creator"}
+SUBSCRIPTION_CONFIRMED_TEXT = (
+    "Всё проверено, вы молодец! Можете пользоваться ботом 🚀"
+)
 
 
 class SubscriptionCheckError(RuntimeError):
@@ -69,6 +72,10 @@ async def subscription_callback_handler(callback: CallbackQuery) -> None:
 
     if is_subscribed:
         await callback.answer("Подписка подтверждена ✅")
+        await callback.bot.send_message(
+            chat_id=callback.from_user.id,
+            text=SUBSCRIPTION_CONFIRMED_TEXT,
+        )
     else:
         await callback.answer(
             "Подпишись на канал и нажми кнопку ещё раз.",
@@ -107,6 +114,7 @@ async def link_handler(message: Message) -> None:
         )
         return
 
+    await message.answer(SUBSCRIPTION_CONFIRMED_TEXT)
     progress_message = await message.answer("Скачиваю медиа...")
 
     try:
