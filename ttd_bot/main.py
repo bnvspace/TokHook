@@ -145,7 +145,6 @@ async def link_handler(message: Message) -> None:
             )
             return
 
-        await message.answer(SUBSCRIPTION_CONFIRMED_TEXT)
         progress_message = await message.answer("Скачиваю медиа...")
         try:
             await asyncio.wait_for(

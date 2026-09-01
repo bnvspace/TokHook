@@ -99,3 +99,54 @@ def test_subscription_callback_answers_negative_on_every_press(monkeypatch) -> N
     assert callback.answer.await_count == 2
     assert callback.answer.await_args_list[0].kwargs["show_alert"] is True
     assert callback.bot.send_message.await_count == 0
+
+
+def test_link_handler_does_not_repeat_subscription_confirmation(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        main,
+        "SETTINGS",
+        Settings(
+            telegram_bot_token="test",
+            tiktok_cookies_path=None,
+            camoufox_profile_path=tmp_path,
+            required_channel_username="@GlitchTMA",
+        ),
+    )
+    monkeypatch.setattr(main, "TEMP_ROOT", tmp_path)
+    monkeypatch.setattr(main, "_is_subscribed", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        main,
+        "download_tiktok_media",
+        lambda *args: main.DownloadedMedia(videos=[], images=[]),
+    )
+    send_media_mock = AsyncMock()
+    monkeypatch.setattr(main, "_send_media", send_media_mock)
+
+    class _NoopChatAction:
+        @classmethod
+        def upload_document(cls, **kwargs):
+            return cls()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(main, "ChatActionSender", _NoopChatAction)
+
+    message = Message(
+        message_id=1,
+        date=datetime.now(timezone.utc),
+        chat=Chat(id=1, type="private"),
+        from_user=User(id=42, is_bot=False, first_name="Test"),
+        text="https://vt.tiktok.com/ZSVqrd8mD/",
+    )
+    progress_message = SimpleNamespace(edit_text=AsyncMock(), delete=AsyncMock())
+
+    with patch.object(Message, "answer", new_callable=AsyncMock) as answer_mock:
+        answer_mock.return_value = progress_message
+        asyncio.run(main.link_handler(message))
+
+    assert [call.args[0] for call in answer_mock.await_args_list] == ["Скачиваю медиа..."]
+    send_media_mock.assert_awaited_once()
