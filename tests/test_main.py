@@ -23,6 +23,15 @@ def test_custom_emoji_rejection_keeps_download_progress_message() -> None:
     action.assert_awaited_with("Скачиваю… ⏳", parse_mode=main.ParseMode.HTML)
 
 
+def test_tiktok_emoji_is_added_to_text_without_changing_links() -> None:
+    action = AsyncMock()
+    asyncio.run(main._send_emoji_text(action, '<a href="https://t.me/TikTok">канал</a> и TikTok-пост.'))
+    action.assert_awaited_once_with(
+        f'<a href="https://t.me/TikTok">канал</a> и пост TikTok {main.TIKTOK_EMOJI}.',
+        parse_mode=main.ParseMode.HTML,
+    )
+
+
 def _callback(status: str) -> SimpleNamespace:
     bot = SimpleNamespace(
         get_chat_member=AsyncMock(return_value=SimpleNamespace(status=status)),
@@ -92,8 +101,9 @@ def test_subscription_callback_updates_only_the_welcome_status(monkeypatch) -> N
         asyncio.run(main.subscription_callback_handler(callback))
 
     assert edit_mock.await_count == 2
-    assert edit_mock.await_args_list[0].args[0] == main._start_text("⏳ Проверяю подписку…")
-    assert message.text == main._start_text(main.SUBSCRIPTION_CONFIRMED_TEXT)
+    pending_text = edit_mock.await_args_list[0].args[0]
+    assert pending_text.replace(f" {main.TIKTOK_EMOJI}", "") == main._start_text("⏳ Проверяю подписку…")
+    assert message.text.replace(f" {main.TIKTOK_EMOJI}", "") == main._start_text(main.SUBSCRIPTION_CONFIRMED_TEXT)
     assert main._subscription_button_state(message) is True
     assert callback.answer.await_count == 2
     answer_mock.assert_not_awaited()

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
+from html import escape
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -45,6 +47,7 @@ WHALE_EMOJI = '<tg-emoji emoji-id="5400362079783770689">🐳</tg-emoji>'
 LOADING_EMOJI = '<tg-emoji emoji-id="5213452215527677338">⏳</tg-emoji>'
 WAVE_EMOJI = '<tg-emoji emoji-id="5368488749523029379">👋</tg-emoji>'
 ARROW_EMOJI = '<tg-emoji emoji-id="5933496039523752723">➡️</tg-emoji>'
+TIKTOK_EMOJI = '<tg-emoji emoji-id="5855155960598762938">📹</tg-emoji>'
 SUBSCRIPTION_CONFIRMED_TEXT = (
     f"Всё проверено, вы молодец! Можете пользоваться ботом {ROCKET_EMOJI}"
 )
@@ -55,6 +58,14 @@ class SubscriptionCheckError(RuntimeError):
 
 
 async def _send_emoji_text(action, text: str, **kwargs) -> Message:
+    text = re.sub(
+        r"<[^>]+>|\bTikTok\b(?:-пост\b)?",
+        lambda match: {
+            "TikTok": f"TikTok {TIKTOK_EMOJI}",
+            "TikTok-пост": f"пост TikTok {TIKTOK_EMOJI}",
+        }.get(match[0], match[0]),
+        text,
+    )
     try:
         return await action(text, parse_mode=ParseMode.HTML, **kwargs)
     except TelegramBadRequest as exc:
@@ -64,6 +75,7 @@ async def _send_emoji_text(action, text: str, **kwargs) -> Message:
             .replace(LOADING_EMOJI, "⏳")
             .replace(WAVE_EMOJI, "👋")
             .replace(ARROW_EMOJI, "➡️")
+            .replace(TIKTOK_EMOJI, "📹")
         )
         if fallback == text or "message is not modified" in exc.message.lower():
             raise
@@ -128,14 +140,14 @@ async def subscription_callback_handler(callback: CallbackQuery) -> None:
 
 @router.message(Command("help"))
 async def help_handler(message: Message) -> None:
-    await message.answer(HELP_TEXT)
+    await _send_emoji_text(message.answer, HELP_TEXT)
 
 
 @router.message(F.text)
 async def link_handler(message: Message) -> None:
     url = extract_tiktok_url(message.text or "")
     if not url:
-        await message.answer("Пришли ссылку на TikTok-пост сообщением.")
+        await _send_emoji_text(message.answer, "Пришли ссылку на пост TikTok сообщением.")
         return
 
     if message.from_user is None:
@@ -206,9 +218,9 @@ async def link_handler(message: Message) -> None:
             DOWNLOAD_SEMAPHORE.release()
     except TikTokDownloadError as exc:
         if progress_message is not None:
-            await progress_message.edit_text(str(exc))
+            await _send_emoji_text(progress_message.edit_text, escape(str(exc)))
         else:
-            await message.answer(str(exc))
+            await _send_emoji_text(message.answer, escape(str(exc)))
         return
     except Exception:
         logging.exception("Unhandled error while processing TikTok URL: %s", url)
