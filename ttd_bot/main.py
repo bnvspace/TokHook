@@ -173,7 +173,7 @@ async def link_handler(message: Message) -> None:
 
         progress_message = await _send_emoji_text(
             message.answer,
-            f"{LOADING_EMOJI} ▰▱▱  Проверяю ссылку и готовлю загрузку…",
+            f"▰▱▱  Проверяю ссылку и готовлю загрузку… {LOADING_EMOJI}",
         )
         try:
             await asyncio.wait_for(
@@ -227,7 +227,7 @@ async def link_handler(message: Message) -> None:
 async def _edit_progress(message: Message, text: str) -> None:
     try:
         async with asyncio.timeout(5):
-            await _send_emoji_text(message.edit_text, f"{LOADING_EMOJI} {text}")
+            await _send_emoji_text(message.edit_text, f"{text} {LOADING_EMOJI}")
     except (TelegramAPIError, TimeoutError):
         logging.debug("Could not edit download progress", exc_info=True)
 

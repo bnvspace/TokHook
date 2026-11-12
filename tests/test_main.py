@@ -17,10 +17,10 @@ def test_custom_emoji_rejection_keeps_download_progress_message() -> None:
     )
     action = AsyncMock(side_effect=[rejection, None])
 
-    asyncio.run(main._send_emoji_text(action, f"{main.LOADING_EMOJI} Скачиваю…"))
+    asyncio.run(main._send_emoji_text(action, f"Скачиваю… {main.LOADING_EMOJI}"))
 
     assert action.await_count == 2
-    action.assert_awaited_with("⏳ Скачиваю…", parse_mode=main.ParseMode.HTML)
+    action.assert_awaited_with("Скачиваю… ⏳", parse_mode=main.ParseMode.HTML)
 
 
 def _callback(status: str) -> SimpleNamespace:
@@ -169,7 +169,7 @@ def test_link_handler_does_not_repeat_subscription_confirmation(monkeypatch, tmp
         asyncio.run(main.link_handler(message))
 
     answer_mock.assert_awaited_once_with(
-        f"{main.LOADING_EMOJI} ▰▱▱  Проверяю ссылку и готовлю загрузку…",
+        f"▰▱▱  Проверяю ссылку и готовлю загрузку… {main.LOADING_EMOJI}",
         parse_mode=main.ParseMode.HTML,
     )
     send_media_mock.assert_awaited_once()
