@@ -40,10 +40,10 @@ def test_subscription_callback_checks_and_responds_on_every_press(monkeypatch) -
 
     assert callback.bot.get_chat_member.await_count == 2
     assert callback.answer.await_count == 2
-    assert callback.bot.send_message.await_count == 2
+    callback.bot.send_message.assert_not_awaited()
 
 
-def test_subscription_callback_updates_button_once_but_confirms_every_press(monkeypatch) -> None:
+def test_subscription_callback_edits_original_message_once(monkeypatch) -> None:
     monkeypatch.setattr(
         main,
         "SETTINGS",
@@ -64,19 +64,23 @@ def test_subscription_callback_updates_button_once_but_confirms_every_press(monk
     )
     callback.message = message
 
-    async def apply_markup(*, reply_markup) -> None:
+    async def apply_edit(text, *, reply_markup) -> None:
+        object.__setattr__(message, "text", text)
         object.__setattr__(message, "reply_markup", reply_markup)
 
     with (
         patch.object(Message, "answer", new_callable=AsyncMock) as answer_mock,
-        patch.object(Message, "edit_reply_markup", new_callable=AsyncMock) as edit_mock,
+        patch.object(Message, "edit_text", new_callable=AsyncMock) as edit_mock,
     ):
-        edit_mock.side_effect = apply_markup
+        edit_mock.side_effect = apply_edit
         asyncio.run(main.subscription_callback_handler(callback))
         asyncio.run(main.subscription_callback_handler(callback))
 
     assert edit_mock.await_count == 1
-    assert answer_mock.await_count == 2
+    assert message.text == main.SUBSCRIPTION_CONFIRMED_TEXT
+    assert main._subscription_button_state(message) is True
+    assert callback.answer.await_count == 2
+    answer_mock.assert_not_awaited()
 
 
 def test_subscription_callback_answers_negative_on_every_press(monkeypatch) -> None:
@@ -148,5 +152,5 @@ def test_link_handler_does_not_repeat_subscription_confirmation(monkeypatch, tmp
         answer_mock.return_value = progress_message
         asyncio.run(main.link_handler(message))
 
-    assert [call.args[0] for call in answer_mock.await_args_list] == ["Скачиваю медиа..."]
+    answer_mock.assert_awaited_once_with("▰▱▱  Проверяю ссылку и готовлю загрузку…")
     send_media_mock.assert_awaited_once()

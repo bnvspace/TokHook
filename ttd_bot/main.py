@@ -81,23 +81,20 @@ async def subscription_callback_handler(callback: CallbackQuery) -> None:
 
     if isinstance(callback.message, Message):
         new_markup = _subscription_keyboard(is_subscribed)
-        if _subscription_button_state(callback.message) is not is_subscribed:
-            try:
-                await callback.message.edit_reply_markup(reply_markup=new_markup)
-            except TelegramAPIError:
-                logging.exception("Could not update subscription button")
-
-    if is_subscribed:
         try:
-            if isinstance(callback.message, Message):
-                await callback.message.answer(SUBSCRIPTION_CONFIRMED_TEXT)
-            else:
-                await callback.bot.send_message(
-                    chat_id=callback.from_user.id,
-                    text=SUBSCRIPTION_CONFIRMED_TEXT,
+            if is_subscribed:
+                if callback.message.text != SUBSCRIPTION_CONFIRMED_TEXT:
+                    await callback.message.edit_text(
+                        SUBSCRIPTION_CONFIRMED_TEXT, reply_markup=new_markup
+                    )
+            elif callback.message.text == SUBSCRIPTION_CONFIRMED_TEXT:
+                await callback.message.edit_text(
+                    _subscription_prompt(), parse_mode=ParseMode.HTML, reply_markup=new_markup
                 )
+            elif _subscription_button_state(callback.message) is not False:
+                await callback.message.edit_reply_markup(reply_markup=new_markup)
         except TelegramAPIError:
-            logging.exception("Could not send subscription confirmation")
+            logging.exception("Could not update subscription message")
 
 
 @router.message(Command("help"))
@@ -145,7 +142,7 @@ async def link_handler(message: Message) -> None:
             )
             return
 
-        progress_message = await message.answer("Скачиваю медиа...")
+        progress_message = await message.answer("▰▱▱  Проверяю ссылку и готовлю загрузку…")
         try:
             await asyncio.wait_for(
                 DOWNLOAD_SEMAPHORE.acquire(),
@@ -162,7 +159,8 @@ async def link_handler(message: Message) -> None:
             with TemporaryDirectory(prefix="ttd_", dir=TEMP_ROOT) as temp_dir:
                 download_dir = Path(temp_dir)
                 async with ChatActionSender.upload_document(chat_id=message.chat.id, bot=message.bot):
-                    media = await asyncio.to_thread(
+                    media = await _download_with_progress(
+                        progress_message,
                         download_tiktok_media,
                         url,
                         download_dir,
@@ -170,7 +168,7 @@ async def link_handler(message: Message) -> None:
                         _get_settings().camoufox_profile_path,
                     )
 
-                await progress_message.edit_text("Отправляю медиа...")
+                await _edit_progress(progress_message, "▰▰▰  Отправляю медиа…")
                 await _send_media(message, media)
         finally:
             DOWNLOAD_SEMAPHORE.release()
@@ -192,6 +190,30 @@ async def link_handler(message: Message) -> None:
 
     if progress_message is not None:
         await progress_message.delete()
+
+
+async def _edit_progress(message: Message, text: str) -> None:
+    try:
+        async with asyncio.timeout(5):
+            await message.edit_text(text)
+    except (TelegramAPIError, TimeoutError):
+        logging.debug("Could not edit download progress", exc_info=True)
+
+
+async def _download_with_progress(message: Message, download, *args) -> DownloadedMedia:
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    task = asyncio.create_task(asyncio.to_thread(download, *args))
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=4)
+            if done:
+                return task.result()
+            elapsed = int(loop.time() - started)
+            await _edit_progress(message, f"▰▰▱  Скачиваю медиа… {elapsed} сек.")
+    finally:
+        if not task.done():
+            task.cancel()
 
 
 async def _send_media(message: Message, media: DownloadedMedia) -> None:
