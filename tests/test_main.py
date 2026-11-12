@@ -43,7 +43,7 @@ def test_subscription_callback_checks_and_responds_on_every_press(monkeypatch) -
     callback.bot.send_message.assert_not_awaited()
 
 
-def test_subscription_callback_edits_original_message_once(monkeypatch) -> None:
+def test_subscription_callback_updates_only_the_welcome_status(monkeypatch) -> None:
     monkeypatch.setattr(
         main,
         "SETTINGS",
@@ -60,11 +60,12 @@ def test_subscription_callback_edits_original_message_once(monkeypatch) -> None:
         date=datetime.now(timezone.utc),
         chat=Chat(id=1, type="private"),
         from_user=User(id=42, is_bot=False, first_name="Test"),
-        reply_markup=main._subscription_keyboard(False),
+        text=main._start_text(),
+        reply_markup=main._subscription_keyboard(),
     )
     callback.message = message
 
-    async def apply_edit(text, *, reply_markup) -> None:
+    async def apply_edit(text, *, reply_markup, parse_mode) -> None:
         object.__setattr__(message, "text", text)
         object.__setattr__(message, "reply_markup", reply_markup)
 
@@ -76,8 +77,9 @@ def test_subscription_callback_edits_original_message_once(monkeypatch) -> None:
         asyncio.run(main.subscription_callback_handler(callback))
         asyncio.run(main.subscription_callback_handler(callback))
 
-    assert edit_mock.await_count == 1
-    assert message.text == main.SUBSCRIPTION_CONFIRMED_TEXT
+    assert edit_mock.await_count == 2
+    assert edit_mock.await_args_list[0].args[0] == main._start_text("⏳ Проверяю подписку…")
+    assert message.text == main._start_text(main.SUBSCRIPTION_CONFIRMED_TEXT)
     assert main._subscription_button_state(message) is True
     assert callback.answer.await_count == 2
     answer_mock.assert_not_awaited()
@@ -121,7 +123,7 @@ def test_link_handler_does_not_repeat_subscription_confirmation(monkeypatch, tmp
     monkeypatch.setattr(
         main,
         "download_tiktok_media",
-        lambda *args: main.DownloadedMedia(videos=[], images=[]),
+        lambda *args, **kwargs: main.DownloadedMedia(videos=[], images=[]),
     )
     send_media_mock = AsyncMock()
     monkeypatch.setattr(main, "_send_media", send_media_mock)

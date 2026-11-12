@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 from http.cookiejar import MozillaCookieJar
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse, urlunparse
 from urllib.request import HTTPRedirectHandler, HTTPCookieProcessor, Request, build_opener
@@ -105,6 +105,8 @@ def download_tiktok_media(
     download_dir: Path,
     cookies_path: Path | None = None,
     camoufox_profile_path: Path | None = None,
+    *,
+    on_stage: Callable[[str], None] | None = None,
 ) -> DownloadedMedia:
     if not _is_allowed_tiktok_url(url):
         raise TikTokDownloadError("Похоже, ссылка не ведет на TikTok-пост.")
@@ -120,6 +122,8 @@ def download_tiktok_media(
     normalized_url = normalize_tiktok_download_url(resolved_url)
 
     if is_tiktok_photo_url(resolved_url):
+        if on_stage:
+            on_stage("Ищу и скачиваю фотографии")
         images = _download_photo_post_images(
             normalized_url,
             download_dir,
@@ -131,6 +135,8 @@ def download_tiktok_media(
             return DownloadedMedia(videos=[], images=images)
 
     info: object | None = None
+    if on_stage:
+        on_stage("Получаю медиа с TikTok")
     download_error = _run_yt_dlp(
         normalized_url,
         download_dir,
@@ -143,6 +149,8 @@ def download_tiktok_media(
         media_files = _collect_media_from_info(info, download_dir)
 
     if not media_files:
+        if on_stage:
+            on_stage("Ищу фотографии в публикации")
         media_files = _download_photo_post_images(
             normalized_url,
             download_dir,
@@ -166,6 +174,8 @@ def download_tiktok_media(
             download_tiktok_media_with_camoufox,
         )
 
+        if on_stage:
+            on_stage("Пробую скачать через браузер")
         browser_result = download_tiktok_media_with_camoufox(
             normalized_url,
             download_dir,

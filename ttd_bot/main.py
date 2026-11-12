@@ -61,15 +61,41 @@ async def start_handler(message: Message) -> None:
 
 @router.callback_query(F.data == SUBSCRIPTION_CALLBACK)
 async def subscription_callback_handler(callback: CallbackQuery) -> None:
+    message = callback.message if isinstance(callback.message, Message) else None
+    is_welcome = message is not None and (message.text or "").startswith("Привет! 👋")
+    previous_state = _subscription_button_state(message) if message else None
+    checking = is_welcome and previous_state is None
+
+    def render(status: str | None = None) -> str:
+        return _start_text(status) if is_welcome else status or _subscription_prompt()
+
+    async def edit_status(text: str, state: bool | None) -> None:
+        if message is None:
+            return
+        try:
+            async with asyncio.timeout(3):
+                await message.edit_text(
+                    text, parse_mode=ParseMode.HTML, reply_markup=_subscription_keyboard(state)
+                )
+        except (TelegramAPIError, TimeoutError):
+            logging.debug("Could not update subscription message", exc_info=True)
+
+    if checking:
+        await edit_status(render("⏳ Проверяю подписку…"), None)
     try:
         is_subscribed = await _is_subscribed(callback.bot, callback.from_user.id)
     except SubscriptionCheckError:
         logging.exception("Could not check subscription for user %s", callback.from_user.id)
+        if checking:
+            await edit_status(render(), None)
         await callback.answer(
             "Не удалось проверить подписку. Убедись, что бот добавлен администратором канала.",
             show_alert=True,
         )
         return
+
+    if message and (checking or previous_state is not is_subscribed):
+        await edit_status(render(SUBSCRIPTION_CONFIRMED_TEXT if is_subscribed else None), is_subscribed)
 
     if is_subscribed:
         await callback.answer("Подписка подтверждена ✅")
@@ -78,24 +104,6 @@ async def subscription_callback_handler(callback: CallbackQuery) -> None:
             "Подпишись на канал и нажми кнопку ещё раз.",
             show_alert=True,
         )
-
-    if isinstance(callback.message, Message):
-        new_markup = _subscription_keyboard(is_subscribed)
-        try:
-            if is_subscribed:
-                if callback.message.text != SUBSCRIPTION_CONFIRMED_TEXT:
-                    await callback.message.edit_text(
-                        SUBSCRIPTION_CONFIRMED_TEXT, reply_markup=new_markup
-                    )
-            elif callback.message.text == SUBSCRIPTION_CONFIRMED_TEXT:
-                await callback.message.edit_text(
-                    _subscription_prompt(), parse_mode=ParseMode.HTML, reply_markup=new_markup
-                )
-            elif _subscription_button_state(callback.message) is not False:
-                await callback.message.edit_reply_markup(reply_markup=new_markup)
-        except TelegramAPIError:
-            logging.exception("Could not update subscription message")
-
 
 @router.message(Command("help"))
 async def help_handler(message: Message) -> None:
@@ -168,7 +176,7 @@ async def link_handler(message: Message) -> None:
                         _get_settings().camoufox_profile_path,
                     )
 
-                await _edit_progress(progress_message, "▰▰▰  Отправляю медиа…")
+                await _edit_progress(progress_message, "▰▰▰  Медиа скачано. Отправляю в Telegram…")
                 await _send_media(message, media)
         finally:
             DOWNLOAD_SEMAPHORE.release()
@@ -203,14 +211,20 @@ async def _edit_progress(message: Message, text: str) -> None:
 async def _download_with_progress(message: Message, download, *args) -> DownloadedMedia:
     loop = asyncio.get_running_loop()
     started = loop.time()
-    task = asyncio.create_task(asyncio.to_thread(download, *args))
+    stage = "Открываю ссылку TikTok"
+
+    def report_stage(value: str) -> None:
+        nonlocal stage
+        stage = value
+
+    task = asyncio.create_task(asyncio.to_thread(download, *args, on_stage=report_stage))
     try:
         while True:
             done, _ = await asyncio.wait({task}, timeout=4)
             if done:
                 return task.result()
             elapsed = int(loop.time() - started)
-            await _edit_progress(message, f"▰▰▱  Скачиваю медиа… {elapsed} сек.")
+            await _edit_progress(message, f"▰▰▱  {stage}… {elapsed} сек.")
     finally:
         if not task.done():
             task.cancel()
@@ -250,8 +264,8 @@ def _channel_url() -> str:
     return f"https://t.me/{username}"
 
 
-def _start_text() -> str:
-    return (
+def _start_text(status: str | None = None) -> str:
+    welcome = (
         "Привет! 👋\n"
         "Я помогу скачать медиа из TikTok.\n"
         "Просто отправь мне ссылку на публикацию!\n"
@@ -260,9 +274,11 @@ def _start_text() -> str:
         "• извлекать изображения из фотопостов;\n"
         "• обрабатывать короткие ссылки.\n"
         "Пришли ссылку, и я начну загрузку 🚀\n\n"
+    )
+    return welcome + (status or (
         f"Но сначала подпишись на ➡️ <a href=\"{_channel_url()}\">канал</a> "
         "- без этого работать ничего не будет 🤣"
-    )
+    ))
 
 
 def _subscription_prompt() -> str:
