@@ -60,6 +60,7 @@ ALLOWED_MEDIA_HOST_SUFFIXES = (
     ".tiktok.com",
     ".tiktokcdn.com",
     ".tiktokcdn-us.com",
+    ".tiktokcdn-eu.com",
     ".tiktokv.com",
     ".ibytedtos.com",
     ".muscdn.com",
@@ -124,6 +125,7 @@ def download_tiktok_media(
             download_dir,
             cookies_path,
             deadline=deadline,
+            impersonate_fallback=True,
         )
         if images:
             return DownloadedMedia(videos=[], images=images)
@@ -309,6 +311,7 @@ def _download_photo_post_images(
     cookies_path: Path | None,
     *,
     deadline: float | None = None,
+    impersonate_fallback: bool = False,
 ) -> list[Path]:
     if deadline is None:
         deadline = time.monotonic() + MAX_DOWNLOAD_SECONDS
@@ -323,12 +326,23 @@ def _download_photo_post_images(
             deadline=deadline,
         )
     except (HTTPError, URLError, OSError):
-        return []
+        webpage = ""
 
     image_urls = _extract_photo_image_urls(webpage)
-    if not image_urls:
-        return []
+    images = _download_photo_images(image_urls, page_url, download_dir, cookies_path, deadline)
+    if not images and impersonate_fallback:
+        image_urls = _extract_photo_image_urls(_download_impersonated_photo_page(page_url, deadline))
+        images = _download_photo_images(image_urls, page_url, download_dir, cookies_path, deadline)
+    return images
 
+
+def _download_photo_images(
+    image_urls: list[str],
+    page_url: str,
+    download_dir: Path,
+    cookies_path: Path | None,
+    deadline: float,
+) -> list[Path]:
     downloaded_images: list[Path] = []
     for index, image_url in enumerate(image_urls[:MAX_PHOTO_IMAGES], start=1):
         timeout = _remaining_timeout(deadline, 30)
@@ -361,6 +375,23 @@ def _download_photo_post_images(
     return downloaded_images
 
 
+def _download_impersonated_photo_page(url: str, deadline: float) -> str:
+    from curl_cffi import CurlOpt, requests
+
+    timeout = _remaining_timeout(deadline, 15)
+    if timeout <= 0 or not _is_allowed_tiktok_url(url):
+        return ""
+
+    try:
+        with requests.Session(curl_options={CurlOpt.MAXFILESIZE_LARGE: MAX_PAGE_BYTES}) as session:
+            response = session.get(url, impersonate="safari", timeout=timeout, allow_redirects=False)
+            if response.status_code == 200 and len(response.content) <= MAX_PAGE_BYTES:
+                return response.text
+    except requests.RequestsError:
+        pass
+    return ""
+
+
 def _extract_photo_image_urls(webpage: str) -> list[str]:
     match = UNIVERSAL_DATA_RE.search(webpage)
     if not match:
@@ -376,11 +407,13 @@ def _extract_photo_image_urls(webpage: str) -> list[str]:
     def visit(node: object) -> None:
         if isinstance(node, dict):
             image_post = node.get("imagePost")
-            if isinstance(image_post, dict):
-                for image in image_post.get("images", []):
+            images = image_post.get("images") if isinstance(image_post, dict) else None
+            if isinstance(images, list):
+                for image in images:
                     if not isinstance(image, dict):
                         continue
-                    url_list = image.get("imageURL", {}).get("urlList", [])
+                    image_url = image.get("imageURL")
+                    url_list = image_url.get("urlList") if isinstance(image_url, dict) else None
                     if not isinstance(url_list, list):
                         continue
                     first_url = next(
