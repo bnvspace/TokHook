@@ -3,10 +3,24 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import SendMessage
 from aiogram.types import Chat, Message, User
 
 from ttd_bot import main
 from ttd_bot.config import Settings
+
+
+def test_custom_emoji_rejection_keeps_download_progress_message() -> None:
+    rejection = TelegramBadRequest(
+        method=SendMessage(chat_id=42, text="test"), message="Custom emoji are not allowed"
+    )
+    action = AsyncMock(side_effect=[rejection, None])
+
+    asyncio.run(main._send_emoji_text(action, f"{main.LOADING_EMOJI} Скачиваю…"))
+
+    assert action.await_count == 2
+    action.assert_awaited_with("⏳ Скачиваю…", parse_mode=main.ParseMode.HTML)
 
 
 def _callback(status: str) -> SimpleNamespace:
@@ -154,5 +168,8 @@ def test_link_handler_does_not_repeat_subscription_confirmation(monkeypatch, tmp
         answer_mock.return_value = progress_message
         asyncio.run(main.link_handler(message))
 
-    answer_mock.assert_awaited_once_with("▰▱▱  Проверяю ссылку и готовлю загрузку…")
+    answer_mock.assert_awaited_once_with(
+        f"{main.LOADING_EMOJI} ▰▱▱  Проверяю ссылку и готовлю загрузку…",
+        parse_mode=main.ParseMode.HTML,
+    )
     send_media_mock.assert_awaited_once()

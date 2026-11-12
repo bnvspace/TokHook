@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
@@ -40,8 +40,13 @@ HELP_TEXT = (
 
 SUBSCRIPTION_CALLBACK = "check_subscription"
 SUBSCRIBED_STATUSES = {"member", "administrator", "creator"}
+ROCKET_EMOJI = '<tg-emoji emoji-id="5188481279963715781">🚀</tg-emoji>'
+WHALE_EMOJI = '<tg-emoji emoji-id="5400362079783770689">🐳</tg-emoji>'
+LOADING_EMOJI = '<tg-emoji emoji-id="5213452215527677338">⏳</tg-emoji>'
+WAVE_EMOJI = '<tg-emoji emoji-id="5368488749523029379">👋</tg-emoji>'
+ARROW_EMOJI = '<tg-emoji emoji-id="5933496039523752723">➡️</tg-emoji>'
 SUBSCRIPTION_CONFIRMED_TEXT = (
-    "Всё проверено, вы молодец! Можете пользоваться ботом 🚀"
+    f"Всё проверено, вы молодец! Можете пользоваться ботом {ROCKET_EMOJI}"
 )
 
 
@@ -49,12 +54,28 @@ class SubscriptionCheckError(RuntimeError):
     """Raised when Telegram did not allow checking channel membership."""
 
 
+async def _send_emoji_text(action, text: str, **kwargs) -> Message:
+    try:
+        return await action(text, parse_mode=ParseMode.HTML, **kwargs)
+    except TelegramBadRequest as exc:
+        fallback = (
+            text.replace(ROCKET_EMOJI, "🚀")
+            .replace(WHALE_EMOJI, "🐳")
+            .replace(LOADING_EMOJI, "⏳")
+            .replace(WAVE_EMOJI, "👋")
+            .replace(ARROW_EMOJI, "➡️")
+        )
+        if fallback == text or "message is not modified" in exc.message.lower():
+            raise
+        return await action(fallback, parse_mode=ParseMode.HTML, **kwargs)
+
+
 @router.message(Command("strat"))
 @router.message(CommandStart())
 async def start_handler(message: Message) -> None:
-    await message.answer(
+    await _send_emoji_text(
+        message.answer,
         _start_text(),
-        parse_mode=ParseMode.HTML,
         reply_markup=_subscription_keyboard(),
     )
 
@@ -62,7 +83,7 @@ async def start_handler(message: Message) -> None:
 @router.callback_query(F.data == SUBSCRIPTION_CALLBACK)
 async def subscription_callback_handler(callback: CallbackQuery) -> None:
     message = callback.message if isinstance(callback.message, Message) else None
-    is_welcome = message is not None and (message.text or "").startswith("Привет! 👋")
+    is_welcome = message is not None and (message.text or "").startswith("Привет! ")
     previous_state = _subscription_button_state(message) if message else None
     checking = is_welcome and previous_state is None
 
@@ -74,8 +95,8 @@ async def subscription_callback_handler(callback: CallbackQuery) -> None:
             return
         try:
             async with asyncio.timeout(3):
-                await message.edit_text(
-                    text, parse_mode=ParseMode.HTML, reply_markup=_subscription_keyboard(state)
+                await _send_emoji_text(
+                    message.edit_text, text, reply_markup=_subscription_keyboard(state)
                 )
         except (TelegramAPIError, TimeoutError):
             logging.debug("Could not update subscription message", exc_info=True)
@@ -143,14 +164,17 @@ async def link_handler(message: Message) -> None:
             return
 
         if not is_subscribed:
-            await message.answer(
+            await _send_emoji_text(
+                message.answer,
                 _subscription_prompt(),
-                parse_mode=ParseMode.HTML,
                 reply_markup=_subscription_keyboard(False),
             )
             return
 
-        progress_message = await message.answer("▰▱▱  Проверяю ссылку и готовлю загрузку…")
+        progress_message = await _send_emoji_text(
+            message.answer,
+            f"{LOADING_EMOJI} ▰▱▱  Проверяю ссылку и готовлю загрузку…",
+        )
         try:
             await asyncio.wait_for(
                 DOWNLOAD_SEMAPHORE.acquire(),
@@ -203,7 +227,7 @@ async def link_handler(message: Message) -> None:
 async def _edit_progress(message: Message, text: str) -> None:
     try:
         async with asyncio.timeout(5):
-            await message.edit_text(text)
+            await _send_emoji_text(message.edit_text, f"{LOADING_EMOJI} {text}")
     except (TelegramAPIError, TimeoutError):
         logging.debug("Could not edit download progress", exc_info=True)
 
@@ -266,24 +290,24 @@ def _channel_url() -> str:
 
 def _start_text(status: str | None = None) -> str:
     welcome = (
-        "Привет! 👋\n"
+        f"Привет! {WAVE_EMOJI}\n"
         "Я помогу скачать медиа из TikTok.\n"
         "Просто отправь мне ссылку на публикацию!\n"
         "Я умею:\n"
         "• скачивать видео из TikTok;\n"
         "• извлекать изображения из фотопостов;\n"
         "• обрабатывать короткие ссылки.\n"
-        "Пришли ссылку, и я начну загрузку 🚀\n\n"
+        f"Пришли ссылку, и я начну загрузку {ROCKET_EMOJI}\n\n"
     )
     return welcome + (status or (
-        f"Но сначала подпишись на ➡️ <a href=\"{_channel_url()}\">канал</a> "
-        "- без этого работать ничего не будет 🤣"
+        f"Но сначала подпишись на {ARROW_EMOJI} <a href=\"{_channel_url()}\">канал</a> "
+        f"- без этого работать ничего не будет {WHALE_EMOJI}"
     ))
 
 
 def _subscription_prompt() -> str:
     return (
-        f"Сначала подпишись на ➡️ <a href=\"{_channel_url()}\">канал</a> "
+        f"Сначала подпишись на {ARROW_EMOJI} <a href=\"{_channel_url()}\">канал</a> "
         "и нажми кнопку проверки подписки."
     )
 
